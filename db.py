@@ -75,6 +75,32 @@ def init_db():
             explanation TEXT DEFAULT '',
             FOREIGN KEY (test_id) REFERENCES tests(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS test_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id INTEGER NOT NULL,
+            material_type TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            url TEXT DEFAULT '',
+            file_data BLOB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (test_id) REFERENCES tests(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS programs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (owner_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS program_tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            program_id INTEGER NOT NULL,
+            test_id INTEGER NOT NULL,
+            FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE,
+            FOREIGN KEY (test_id) REFERENCES tests(id) ON DELETE CASCADE,
+            UNIQUE(program_id, test_id)
+        );
     """)
     # Migrations for older DB versions
     cursor = conn.execute("PRAGMA table_info(question_history)")
@@ -99,6 +125,20 @@ def init_db():
         if "test_id" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN test_id INTEGER REFERENCES tests(id)")
             conn.commit()
+
+    # Add source column to questions
+    cursor = conn.execute("PRAGMA table_info(questions)")
+    cols = [row[1] for row in cursor.fetchall()]
+    if "source" not in cols:
+        conn.execute("ALTER TABLE questions ADD COLUMN source TEXT DEFAULT 'manual'")
+        conn.commit()
+
+    # Add language column to tests
+    cursor = conn.execute("PRAGMA table_info(tests)")
+    cols = [row[1] for row in cursor.fetchall()]
+    if "language" not in cols:
+        conn.execute("ALTER TABLE tests ADD COLUMN language TEXT DEFAULT ''")
+        conn.commit()
 
     conn.close()
 
@@ -167,11 +207,11 @@ def _import_json_file(conn, file_path):
 
 # --- Test CRUD ---
 
-def create_test(owner_id, title, description="", author=""):
+def create_test(owner_id, title, description="", author="", language=""):
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO tests (owner_id, title, description, author, is_public) VALUES (?, ?, ?, ?, 1)",
-        (owner_id, title, description, author),
+        "INSERT INTO tests (owner_id, title, description, author, is_public, language) VALUES (?, ?, ?, ?, 1, ?)",
+        (owner_id, title, description, author, language),
     )
     test_id = cursor.lastrowid
     conn.commit()
@@ -179,11 +219,11 @@ def create_test(owner_id, title, description="", author=""):
     return test_id
 
 
-def update_test(test_id, title, description="", author=""):
+def update_test(test_id, title, description="", author="", language=""):
     conn = get_connection()
     conn.execute(
-        "UPDATE tests SET title = ?, description = ?, author = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (title, description, author, test_id),
+        "UPDATE tests SET title = ?, description = ?, author = ?, language = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (title, description, author, language, test_id),
     )
     conn.commit()
     conn.close()
@@ -199,7 +239,7 @@ def delete_test(test_id):
 def get_test(test_id):
     conn = get_connection()
     row = conn.execute(
-        "SELECT id, owner_id, title, description, author, is_public, created_at, updated_at FROM tests WHERE id = ?",
+        "SELECT id, owner_id, title, description, author, is_public, created_at, updated_at, language FROM tests WHERE id = ?",
         (test_id,),
     ).fetchone()
     conn.close()
@@ -208,7 +248,7 @@ def get_test(test_id):
     return {
         "id": row[0], "owner_id": row[1], "title": row[2],
         "description": row[3], "author": row[4], "is_public": row[5],
-        "created_at": row[6], "updated_at": row[7],
+        "created_at": row[6], "updated_at": row[7], "language": row[8] or "",
     }
 
 
@@ -218,7 +258,8 @@ def get_all_tests(user_id=None):
     if user_id:
         rows = conn.execute(
             """SELECT id, owner_id, title, description, author, is_public,
-                      (SELECT COUNT(*) FROM questions WHERE questions.test_id = tests.id) as q_count
+                      (SELECT COUNT(*) FROM questions WHERE questions.test_id = tests.id) as q_count,
+                      language
                FROM tests
                WHERE is_public = 1 OR owner_id = ?
                ORDER BY title""",
@@ -227,7 +268,8 @@ def get_all_tests(user_id=None):
     else:
         rows = conn.execute(
             """SELECT id, owner_id, title, description, author, is_public,
-                      (SELECT COUNT(*) FROM questions WHERE questions.test_id = tests.id) as q_count
+                      (SELECT COUNT(*) FROM questions WHERE questions.test_id = tests.id) as q_count,
+                      language
                FROM tests
                WHERE is_public = 1
                ORDER BY title""",
@@ -235,7 +277,7 @@ def get_all_tests(user_id=None):
     conn.close()
     return [
         {"id": r[0], "owner_id": r[1], "title": r[2], "description": r[3],
-         "author": r[4], "is_public": r[5], "question_count": r[6]}
+         "author": r[4], "is_public": r[5], "question_count": r[6], "language": r[7] or ""}
         for r in rows
     ]
 
@@ -245,7 +287,7 @@ def get_all_tests(user_id=None):
 def get_test_questions(test_id):
     conn = get_connection()
     rows = conn.execute(
-        """SELECT id, question_num, tag, question, options, answer_index, explanation
+        """SELECT id, question_num, tag, question, options, answer_index, explanation, source
            FROM questions WHERE test_id = ?
            ORDER BY question_num""",
         (test_id,),
@@ -254,7 +296,7 @@ def get_test_questions(test_id):
     return [
         {"id": r[1], "tag": r[2], "question": r[3],
          "options": json.loads(r[4]), "answer_index": r[5],
-         "explanation": r[6], "db_id": r[0]}
+         "explanation": r[6], "db_id": r[0], "source": r[7] or "manual"}
         for r in rows
     ]
 
@@ -266,7 +308,7 @@ def get_test_questions_by_ids(test_id, question_nums):
     conn = get_connection()
     placeholders = ",".join("?" for _ in question_nums)
     rows = conn.execute(
-        f"""SELECT id, question_num, tag, question, options, answer_index, explanation
+        f"""SELECT id, question_num, tag, question, options, answer_index, explanation, source
             FROM questions WHERE test_id = ? AND question_num IN ({placeholders})
             ORDER BY question_num""",
         (test_id, *question_nums),
@@ -275,16 +317,16 @@ def get_test_questions_by_ids(test_id, question_nums):
     return [
         {"id": r[1], "tag": r[2], "question": r[3],
          "options": json.loads(r[4]), "answer_index": r[5],
-         "explanation": r[6], "db_id": r[0]}
+         "explanation": r[6], "db_id": r[0], "source": r[7] or "manual"}
         for r in rows
     ]
 
 
-def add_question(test_id, question_num, tag, question, options, answer_index, explanation=""):
+def add_question(test_id, question_num, tag, question, options, answer_index, explanation="", source="manual"):
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO questions (test_id, question_num, tag, question, options, answer_index, explanation) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (test_id, question_num, tag, question, json.dumps(options, ensure_ascii=False), answer_index, explanation),
+        "INSERT INTO questions (test_id, question_num, tag, question, options, answer_index, explanation, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (test_id, question_num, tag, question, json.dumps(options, ensure_ascii=False), answer_index, explanation, source),
     )
     q_id = cursor.lastrowid
     conn.execute("UPDATE tests SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (test_id,))
@@ -331,6 +373,196 @@ def get_test_tags(test_id):
     rows = conn.execute(
         "SELECT DISTINCT tag FROM questions WHERE test_id = ? ORDER BY tag",
         (test_id,),
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def rename_test_tag(test_id, old_tag, new_tag):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE questions SET tag = ? WHERE test_id = ? AND tag = ?",
+        (new_tag, test_id, old_tag),
+    )
+    conn.execute("UPDATE tests SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (test_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_test_tag(test_id, tag, delete_questions=False):
+    conn = get_connection()
+    if delete_questions:
+        conn.execute("DELETE FROM questions WHERE test_id = ? AND tag = ?", (test_id, tag))
+    else:
+        conn.execute("UPDATE questions SET tag = '' WHERE test_id = ? AND tag = ?", (test_id, tag))
+    conn.execute("UPDATE tests SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (test_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- Materials ---
+
+def get_test_materials(test_id):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, material_type, title, url, file_data, created_at FROM test_materials WHERE test_id = ? ORDER BY created_at",
+        (test_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "material_type": r[1], "title": r[2], "url": r[3], "file_data": r[4], "created_at": r[5]}
+        for r in rows
+    ]
+
+
+def add_test_material(test_id, material_type, title, url="", file_data=None):
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO test_materials (test_id, material_type, title, url, file_data) VALUES (?, ?, ?, ?, ?)",
+        (test_id, material_type, title, url, file_data),
+    )
+    mat_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return mat_id
+
+
+def delete_test_material(material_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM test_materials WHERE id = ?", (material_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- Programs ---
+
+def create_program(owner_id, title, description=""):
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO programs (owner_id, title, description) VALUES (?, ?, ?)",
+        (owner_id, title, description),
+    )
+    program_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return program_id
+
+
+def update_program(program_id, title, description=""):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE programs SET title = ?, description = ? WHERE id = ?",
+        (title, description, program_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_program(program_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM programs WHERE id = ?", (program_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_program(program_id):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, owner_id, title, description, created_at FROM programs WHERE id = ?",
+        (program_id,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {"id": row[0], "owner_id": row[1], "title": row[2], "description": row[3], "created_at": row[4]}
+
+
+def get_all_programs(user_id):
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT p.id, p.owner_id, p.title, p.description, p.created_at,
+                  (SELECT COUNT(*) FROM program_tests WHERE program_id = p.id) as test_count
+           FROM programs p
+           WHERE p.owner_id = ?
+           ORDER BY p.title""",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "owner_id": r[1], "title": r[2], "description": r[3],
+         "created_at": r[4], "test_count": r[5]}
+        for r in rows
+    ]
+
+
+def add_test_to_program(program_id, test_id):
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO program_tests (program_id, test_id) VALUES (?, ?)",
+            (program_id, test_id),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    conn.close()
+
+
+def remove_test_from_program(program_id, test_id):
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM program_tests WHERE program_id = ? AND test_id = ?",
+        (program_id, test_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_program_tests(program_id):
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT t.id, t.title, t.description, t.author,
+                  (SELECT COUNT(*) FROM questions WHERE test_id = t.id) as q_count
+           FROM tests t
+           JOIN program_tests pt ON pt.test_id = t.id
+           WHERE pt.program_id = ?
+           ORDER BY t.title""",
+        (program_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "title": r[1], "description": r[2], "author": r[3], "question_count": r[4]}
+        for r in rows
+    ]
+
+
+def get_program_questions(program_id):
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT q.id, q.question_num, q.tag, q.question, q.options, q.answer_index, q.explanation, q.source
+           FROM questions q
+           JOIN program_tests pt ON pt.test_id = q.test_id
+           WHERE pt.program_id = ?
+           ORDER BY q.test_id, q.question_num""",
+        (program_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[1], "tag": r[2], "question": r[3],
+         "options": json.loads(r[4]), "answer_index": r[5],
+         "explanation": r[6], "db_id": r[0], "source": r[7] or "manual"}
+        for r in rows
+    ]
+
+
+def get_program_tags(program_id):
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT DISTINCT q.tag FROM questions q
+           JOIN program_tests pt ON pt.test_id = q.test_id
+           WHERE pt.program_id = ?
+           ORDER BY q.tag""",
+        (program_id,),
     ).fetchall()
     conn.close()
     return [r[0] for r in rows]
