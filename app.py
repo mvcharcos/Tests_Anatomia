@@ -1674,7 +1674,7 @@ def show_test_config():
     # Show materials if any
     materials = get_test_materials(test_id)
     if materials:
-        with st.expander(t("reference_materials", n=len(materials))):
+        with st.expander(t("reference_materials", n=len(materials)), expanded=True):
             for mat in materials:
                 type_icons = {"pdf": "📄", "youtube": "▶️", "image": "🖼️", "url": "🔗"}
                 icon = type_icons.get(mat["material_type"], "📎")
@@ -1694,31 +1694,33 @@ def show_test_config():
                             "⬇️", data=mat["file_data"],
                             file_name=f"{label}.{ext}",
                             key=f"dl_mat_{mat['id']}",
+                            help=t("tooltip_download"),
                         )
                     col_idx += 1
                 elif has_link:
                     with cols[col_idx]:
-                        st.markdown(f'<a href="{mat["url"]}" target="_blank" style="text-decoration:none;font-size:1.4em;">🔗</a>', unsafe_allow_html=True)
+                        st.markdown(f'<a href="{mat["url"]}" target="_blank" style="text-decoration:none;font-size:1.4em;" title="{t("tooltip_open_link")}">🔗</a>', unsafe_allow_html=True)
                     col_idx += 1
                 with cols[col_idx]:
-                    if st.button("👁️", key=f"view_mat_{mat['id']}"):
+                    if st.button("👁️", key=f"view_mat_{mat['id']}", help=t("tooltip_view_material")):
                         for k in list(st.session_state.keys()):
                             if k.startswith("show_mat_"):
                                 del st.session_state[k]
+                        st.session_state.pop("study_mat_id", None)
                         st.session_state[f"show_mat_{mat['id']}"] = True
                         st.rerun()
                 with cols[col_idx + 1]:
                     is_youtube = mat["material_type"] == "youtube" and mat.get("url")
                     can_study = is_youtube and bool(questions)
                     if can_study:
-                        if st.button("📌", key=f"study_mat_{mat['id']}"):
+                        if st.button("📌", key=f"study_mat_{mat['id']}", help=t("tooltip_study_with_questions")):
                             for k in list(st.session_state.keys()):
-                                if k.startswith("study_"):
+                                if k.startswith("show_mat_") or k.startswith("study_"):
                                     del st.session_state[k]
                             st.session_state.study_mat_id = mat['id']
                             st.rerun()
                     else:
-                        st.button("📌", key=f"study_mat_{mat['id']}", disabled=True)
+                        st.button("📌", key=f"study_mat_{mat['id']}", disabled=True, help=t("tooltip_study_with_questions"))
 
             # Render dialog for the active material (only one at a time)
             for mat in materials:
