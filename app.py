@@ -5,7 +5,8 @@ from translations import t
 from db import (
     init_db, get_or_create_google_user, record_answer, get_question_stats,
     create_session, update_session_score, get_user_sessions,
-    get_session_wrong_answers,
+    get_session_wrong_answers, get_topic_statistics, get_tests_performance,
+    get_user_test_ids, get_user_session_count, get_user_program_ids, get_programs_performance,
     get_user_profile, update_user_profile,
     get_user_global_role, set_user_global_role, set_user_global_role_by_email, get_all_users_with_roles,
     toggle_favorite, get_favorite_tests,
@@ -15,20 +16,22 @@ from db import (
     get_test_materials, get_material_by_id, add_test_material, update_test_material, delete_test_material, update_material_transcript, update_material_pause_times,
     get_question_material_links, get_question_material_links_bulk, set_question_material_links,
     create_program, update_program, delete_program, get_program,
-    get_all_programs, add_test_to_program, remove_test_from_program,
-    get_program_tests, get_program_questions, get_program_tags,
+    get_all_programs, add_test_to_program, remove_test_from_program, update_program_test_visibility,
+    get_program_tests, get_program_questions, get_program_tags, get_visibility_options_for_test, get_effective_visibility,
     add_collaborator, remove_collaborator, update_collaborator_role,
-    get_collaborators, get_user_role_for_test, get_shared_tests,
+    get_collaborators, get_user_role_for_test, has_direct_test_access, get_shared_tests,
     resolve_collaborator_user_id,
     add_program_collaborator, remove_program_collaborator, update_program_collaborator_role,
     get_program_collaborators, get_user_role_for_program, get_shared_programs,
+    get_pending_invitations,
+    accept_test_invitation, decline_test_invitation,
+    accept_program_invitation, decline_program_invitation,
 )
 
 init_db()
 
-# Set initial admin users
+# Set initial admin user (only this one is hardcoded, others managed via admin panel)
 set_user_global_role_by_email("mcharcos@socib.es", "admin")
-set_user_global_role_by_email("mvcharcos@gmail.com", "admin")
 
 
 def _is_logged_in():
@@ -999,7 +1002,29 @@ def _time_to_secs(time_str):
 
 
 def _render_material_refs(question_db_id, test_id):
-    """Show clickable material references for a question after explanation."""
+    """Show clickable material references for a question after explanation.
+
+    Does not show references if effective visibility is 'restricted' and user lacks explicit access.
+    For private/hidden visibility, user already has explicit access if they can see the test.
+    """
+    # Check if materials should be hidden due to restricted visibility
+    test = get_test(test_id)
+    if not test:
+        return
+    # Check both test visibility and program visibility (if coming from a program)
+    visibility = test.get("visibility", "public")
+    program_visibility = st.session_state.get("test_program_visibility", "public")
+    effective_visibility = get_effective_visibility(visibility, program_visibility)
+    if effective_visibility == "restricted":
+        logged_in_uid = st.session_state.get("user_id")
+        user_role = get_user_role_for_test(test_id, logged_in_uid) if logged_in_uid else None
+        is_owner = logged_in_uid and test["owner_id"] == logged_in_uid
+        # Show materials if user has any explicit access (owner, global admin, or any collaboration role)
+        can_see_materials = _is_global_admin() or is_owner or user_role is not None
+        if not can_see_materials:
+            return  # Skip showing material references
+    # For private/hidden, user already has explicit access if they can see the test
+
     links = get_question_material_links(question_db_id)
     if not links:
         return
@@ -1101,7 +1126,7 @@ pdfjsLib.getDocument({{data: uint8}}).promise.then(function(pdf) {{
         st.rerun()
 
 
-@st.dialog("📌", width="large")
+@st.dialog("🧠", width="large")
 def _show_study_dialog(mat, label, questions):
     """Play a YouTube video, auto-pause after 60s, show question, resume on answer."""
     import re
@@ -1415,16 +1440,84 @@ def _toggle_bulk_question(db_id):
         st.session_state.bulk_delete_questions.add(db_id)
 
 
-def _render_test_card(test, favorites, prefix="", has_access=True, bulk_delete_mode=False):
-    """Render a single test card with heart and select button."""
+def _get_test_export_data(test_id):
+    """Generate export data for a test. Returns (json_string, title)."""
+    import json as _json
+    test = get_test(test_id)
+    if not test:
+        return "{}", "unknown"
+    questions = get_test_questions(test_id)
+    materials = get_test_materials(test_id)
+    q_db_ids = [q["db_id"] for q in questions]
+    all_q_mat_links = get_question_material_links_bulk(q_db_ids)
+
+    export_materials = []
+    for mat in materials:
+        export_mat = {
+            "id": mat["id"],
+            "material_type": mat["material_type"],
+            "title": mat.get("title", ""),
+            "url": mat.get("url", ""),
+            "pause_times": mat.get("pause_times", ""),
+        }
+        export_materials.append(export_mat)
+
+    export_questions = []
+    for q in questions:
+        eq = {
+            "id": q["id"],
+            "tag": q["tag"],
+            "question": q["question"],
+            "options": q["options"],
+            "answer_index": q["answer_index"],
+            "explanation": q.get("explanation", ""),
+        }
+        links = all_q_mat_links.get(q["db_id"], [])
+        if links:
+            eq["material_refs"] = [
+                {"material_id": lk["material_id"], "context": lk.get("context", "")}
+                for lk in links
+            ]
+        export_questions.append(eq)
+
+    export_collabs = []
+    for c in get_collaborators(test_id):
+        export_collabs.append({"email": c["email"], "role": c["role"]})
+
+    export_data = {
+        "title": test["title"],
+        "description": test.get("description", ""),
+        "author": test.get("author", ""),
+        "language": test.get("language", ""),
+        "visibility": test.get("visibility", "public"),
+        "materials": export_materials,
+        "collaborators": export_collabs,
+        "questions": export_questions,
+    }
+    return _json.dumps(export_data, ensure_ascii=False, indent=2), test["title"]
+
+
+def _render_test_card(test, favorites, prefix="", has_access=True, bulk_delete_mode=False, performance=None, can_edit=False):
+    """Render a single test card with heart, performance circle, select/edit/export buttons."""
     test_id = test["id"]
     is_fav = test_id in favorites
     logged_in = _is_logged_in()
 
+    # Helper to get performance circle based on percent correct
+    def _get_perf_circle(pct):
+        if pct >= 95:
+            return "🟢"  # Green: excellent (>= 95% correct)
+        elif pct >= 80:
+            return "🟡"  # Yellow: good (80-95% correct)
+        elif pct >= 50:
+            return "🟠"  # Orange: needs work (50-80% correct)
+        else:
+            return "🔴"  # Red: struggling (< 50% correct)
+
     with st.container(border=True):
         # Determine columns based on mode
         if bulk_delete_mode:
-            col_check, col_info, col_btn = st.columns([0.5, 4, 1])
+            col_check, col_info, col_btn = st.columns([0.5, 4, 1.5])
             with col_check:
                 # Initialize set if needed
                 if "bulk_delete_tests" not in st.session_state:
@@ -1433,18 +1526,25 @@ def _render_test_card(test, favorites, prefix="", has_access=True, bulk_delete_m
                 st.checkbox("", value=is_selected, key=f"{prefix}bulk_select_{test_id}",
                            label_visibility="collapsed", on_change=_toggle_bulk_test, args=(test_id,))
         elif logged_in:
-            col_fav, col_info, col_btn = st.columns([0.5, 4, 1])
+            col_fav, col_info, col_btn = st.columns([0.5, 3.5, 2])
             with col_fav:
                 heart = "❤️" if is_fav else "🤍"
                 if st.button(heart, key=f"{prefix}fav_{test_id}"):
                     toggle_favorite(st.session_state.user_id, test_id)
                     st.rerun()
         else:
-            col_info, col_btn = st.columns([4, 1])
+            col_info, col_btn = st.columns([4, 2])
         with col_info:
             title_display = test["title"]
             if test.get("visibility") == "private" and not has_access:
                 title_display = "🔒 " + title_display
+            # Add performance circle if user has history for this test
+            if performance and test_id in performance:
+                perf = performance[test_id]
+                circle = _get_perf_circle(perf["percent_correct"])
+                title_display = f"{circle} {title_display}"
+            elif logged_in:
+                title_display = f"⚪ {title_display}"  # Grey: no stats yet
             st.subheader(title_display)
             if test.get("description"):
                 st.write(test["description"])
@@ -1455,13 +1555,37 @@ def _render_test_card(test, favorites, prefix="", has_access=True, bulk_delete_m
                 meta += f"  ·  {_lang_display(test['language'])}"
             st.caption(meta)
         with col_btn:
-            if has_access:
-                if st.button(t("select"), key=f"{prefix}select_{test_id}", use_container_width=True):
-                    st.session_state.selected_test = test_id
-                    st.session_state.page = "Configurar Test"
-                    st.rerun()
-            else:
-                st.button(t("select"), key=f"{prefix}select_{test_id}", use_container_width=True, disabled=True)
+            # Show buttons in a row: Select, Edit (if can_edit), Export (if can_edit)
+            btn_cols = st.columns(3 if can_edit else 1)
+            col_idx = 0
+            with btn_cols[col_idx]:
+                if has_access:
+                    if st.button("▶️", key=f"{prefix}select_{test_id}", use_container_width=True, help=t("select")):
+                        st.session_state.selected_test = test_id
+                        st.session_state.pop("test_program_visibility", None)  # Clear program context
+                        st.session_state.page = "Configurar Test"
+                        st.rerun()
+                else:
+                    st.button("▶️", key=f"{prefix}select_{test_id}", use_container_width=True, disabled=True, help=t("select"))
+            if can_edit:
+                col_idx += 1
+                with btn_cols[col_idx]:
+                    if st.button("✏️", key=f"{prefix}edit_{test_id}", use_container_width=True, help=t("edit_test")):
+                        st.session_state.editing_test_id = test_id
+                        st.session_state.page = "Editar Test"
+                        st.rerun()
+                col_idx += 1
+                with btn_cols[col_idx]:
+                    export_data, export_title = _get_test_export_data(test_id)
+                    st.download_button(
+                        "⬇️",
+                        data=export_data,
+                        file_name=f"{export_title}.json",
+                        mime="application/json",
+                        key=f"{prefix}export_{test_id}",
+                        use_container_width=True,
+                        help=t("export_json"),
+                    )
 
 
 @st.dialog(t("import_test"))
@@ -1506,13 +1630,117 @@ def _import_test_dialog():
             st.error(t("invalid_json"))
 
 
+def _import_questions_dialog(test_id, materials):
+    """Dialog for importing questions from a JSON file."""
+    import json as json_module
+
+    @st.dialog(t("import_questions"))
+    def _dialog():
+        st.write(t("import_questions_desc"))
+
+        # Material selection
+        material_options = [(0, t("no_material"))]
+        for mat in materials:
+            label = mat.get("title") or mat.get("url") or f"Material #{mat['id']}"
+            material_options.append((mat["id"], label))
+
+        selected_mat = st.selectbox(
+            t("associate_material"),
+            options=[opt[0] for opt in material_options],
+            format_func=lambda x: next((opt[1] for opt in material_options if opt[0] == x), ""),
+            key="import_q_material"
+        )
+
+        uploaded_file = st.file_uploader(t("select_json_file"), type=["json"], key="import_questions_file")
+
+        if uploaded_file is not None:
+            try:
+                content = uploaded_file.read().decode("utf-8")
+                json_data = json_module.loads(content)
+
+                # Extract questions array
+                if isinstance(json_data, dict):
+                    questions_list = json_data.get("questions", [])
+                elif isinstance(json_data, list):
+                    questions_list = json_data
+                else:
+                    questions_list = []
+
+                if not questions_list:
+                    st.warning(t("no_questions_in_file"))
+                    return
+
+                st.caption(t("n_questions", n=len(questions_list)))
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button(t("import"), type="primary", use_container_width=True):
+                        next_num = get_next_question_num(test_id)
+                        imported_count = 0
+                        for i, q in enumerate(questions_list):
+                            q_id = add_question(
+                                test_id,
+                                next_num + i,
+                                q.get("tag", "general"),
+                                q.get("question", ""),
+                                q.get("options", []),
+                                q.get("answer_index", 0),
+                                q.get("explanation", ""),
+                                source="json_import"
+                            )
+                            # Link to material if selected
+                            if selected_mat and selected_mat != 0:
+                                set_question_material_links(q_id, [{"material_id": selected_mat, "context": ""}])
+                            imported_count += 1
+                        st.session_state.import_q_success = t("questions_imported", n=imported_count)
+                        st.rerun()
+                with col2:
+                    if st.button(t("cancel"), use_container_width=True):
+                        st.rerun()
+            except json_module.JSONDecodeError:
+                st.error(t("invalid_json"))
+
+    _dialog()
+
+
 def show_test_catalog():
     """Show a searchable catalog of available tests."""
     user_id = st.session_state.get("user_id")
     all_tests = get_all_tests(user_id)
     logged_in = _is_logged_in()
 
+    # Get user's performance for all tests
+    test_performance = {}
+    if logged_in:
+        test_ids = [tt["id"] for tt in all_tests]
+        test_performance = get_tests_performance(user_id, test_ids)
+
     st.header(t("available_tests"))
+
+    # --- Pending Test Invitations Section ---
+    if logged_in:
+        invitations = get_pending_invitations(user_id)
+        test_invitations = invitations["tests"]
+
+        if test_invitations:
+            with st.expander(f"📩 {t('pending_invitations')} ({len(test_invitations)})", expanded=True):
+                for inv in test_invitations:
+                    with st.container(border=True):
+                        col_info, col_actions = st.columns([3, 1])
+                        with col_info:
+                            st.markdown(f"**{t('test_invitation')}:** {inv['title']}")
+                            st.caption(f"{t('invited_by', name=inv['inviter_name'])} {t('invited_as', role=inv['role'])}")
+                        with col_actions:
+                            c1, c2 = st.columns(2)
+                            if c1.button("✓", key=f"accept_test_{inv['test_id']}", help=t("accept_invitation")):
+                                accept_test_invitation(inv['test_id'], user_id)
+                                st.success(t("invitation_accepted"))
+                                st.rerun()
+                            if c2.button("✕", key=f"decline_test_{inv['test_id']}", help=t("decline_invitation")):
+                                decline_test_invitation(inv['test_id'], user_id)
+                                st.info(t("invitation_declined"))
+                                st.rerun()
+            st.divider()
 
     # Show import success message if any
     if "import_success" in st.session_state:
@@ -1603,27 +1831,41 @@ def show_test_catalog():
 
     def _has_access(tt):
         vis = tt.get("visibility", "public")
-        if vis == "public":
+        if vis in ("public", "restricted"):
             return True
         return tt["id"] in accessible_ids
+
+    def _can_edit(tt):
+        """Check if current user can edit this test."""
+        if not logged_in:
+            return False
+        if _is_global_admin():
+            return True
+        if tt.get("owner_id") == st.session_state.user_id:
+            return True
+        # Check if user has reviewer/admin role on this test
+        role = get_user_role_for_test(tt["id"], st.session_state.user_id)
+        return role in ("reviewer", "admin")
 
     if fav_tests:
         st.subheader(t("favorites"))
         for test in fav_tests:
-            _render_test_card(test, favorites, prefix="fav_", has_access=_has_access(test), bulk_delete_mode=bulk_delete_mode)
+            _render_test_card(test, favorites, prefix="fav_", has_access=_has_access(test), bulk_delete_mode=bulk_delete_mode, performance=test_performance, can_edit=_can_edit(test))
 
     if shared_tests:
         st.subheader(t("shared_with_me"))
         for test in shared_tests:
             if test["id"] not in {tt["id"] for tt in fav_tests}:
-                _render_test_card(test, favorites, prefix="shared_", has_access=True, bulk_delete_mode=bulk_delete_mode)
+                # For shared tests, check the role they have
+                can_edit_shared = test.get("role") in ("reviewer", "admin") or _is_global_admin()
+                _render_test_card(test, favorites, prefix="shared_", has_access=True, bulk_delete_mode=bulk_delete_mode, performance=test_performance, can_edit=can_edit_shared)
 
     other_tests = [tt for tt in other_tests if tt["id"] not in shared_test_ids]
     if other_tests:
         if fav_tests or shared_tests:
             st.subheader(t("all_tests"))
         for test in other_tests:
-            _render_test_card(test, favorites, has_access=_has_access(test), bulk_delete_mode=bulk_delete_mode)
+            _render_test_card(test, favorites, has_access=_has_access(test), bulk_delete_mode=bulk_delete_mode, performance=test_performance, can_edit=_can_edit(test))
 
 
 def show_test_config():
@@ -1639,9 +1881,9 @@ def show_test_config():
         st.error(t("test_not_found"))
         return
 
-    # Access control for private/hidden tests
+    # Access control for private/hidden tests (restricted and public are open to everyone)
     visibility = test.get("visibility", "public")
-    if visibility != "public":
+    if visibility not in ("public", "restricted"):
         logged_in_uid = st.session_state.get("user_id")
         has_test_access = (
             logged_in_uid and (
@@ -1671,9 +1913,22 @@ def show_test_config():
     if caption_parts:
         st.caption("  ·  ".join(caption_parts))
 
-    # Show materials if any
+    # Show materials if any (but not for 'restricted' visibility unless user has explicit access)
     materials = get_test_materials(test_id)
-    if materials:
+    show_materials = True
+    # Check both test visibility and program visibility (if coming from a program)
+    program_visibility = st.session_state.get("test_program_visibility", "public")
+    effective_visibility = get_effective_visibility(visibility, program_visibility)
+    if effective_visibility == "restricted":
+        # For restricted visibility, show materials to users with explicit access (any role)
+        logged_in_uid = st.session_state.get("user_id")
+        user_role = get_user_role_for_test(test_id, logged_in_uid) if logged_in_uid else None
+        is_owner = logged_in_uid and test["owner_id"] == logged_in_uid
+        # Show materials if user has any explicit access (owner, global admin, or any collaboration role)
+        can_see_materials = _is_global_admin() or is_owner or user_role is not None
+        show_materials = can_see_materials
+    # For private/hidden visibility, user already has explicit access if they can see the test
+    if materials and show_materials:
         with st.expander(t("reference_materials", n=len(materials)), expanded=True):
             for mat in materials:
                 type_icons = {"pdf": "📄", "youtube": "▶️", "image": "🖼️", "url": "🔗"}
@@ -1713,14 +1968,14 @@ def show_test_config():
                     is_youtube = mat["material_type"] == "youtube" and mat.get("url")
                     can_study = is_youtube and bool(questions)
                     if can_study:
-                        if st.button("📌", key=f"study_mat_{mat['id']}", help=t("tooltip_study_with_questions")):
+                        if st.button("🧠", key=f"study_mat_{mat['id']}", help=t("tooltip_study_with_questions")):
                             for k in list(st.session_state.keys()):
                                 if k.startswith("show_mat_") or k.startswith("study_"):
                                     del st.session_state[k]
                             st.session_state.study_mat_id = mat['id']
                             st.rerun()
                     else:
-                        st.button("📌", key=f"study_mat_{mat['id']}", disabled=True, help=t("tooltip_study_with_questions"))
+                        st.button("🧠", key=f"study_mat_{mat['id']}", disabled=True, help=t("tooltip_study_with_questions"))
 
             # Render dialog for the active material (only one at a time)
             for mat in materials:
@@ -1812,6 +2067,51 @@ def show_test_config():
                 key="export_test_json",
             )
 
+    # --- Global Statistics Section ---
+    if _is_logged_in():
+        topic_stats = get_topic_statistics(st.session_state.user_id, test_id)
+        if topic_stats:
+            # Calculate global totals
+            total_answered = sum(s["total"] for s in topic_stats.values())
+            total_correct = sum(s["correct"] for s in topic_stats.values())
+            total_incorrect = sum(s["incorrect"] for s in topic_stats.values())
+            overall_pct = round(100 * total_correct / total_answered, 1) if total_answered > 0 else 0
+
+            st.subheader(t("your_progress"))
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric(t("total_answered"), total_answered)
+            col2.metric(t("correct_answers"), total_correct)
+            col3.metric(t("incorrect_answers"), total_incorrect)
+            col4.metric(t("overall_score"), f"{overall_pct}%")
+
+            # Find best and worst topics
+            if len(topic_stats) > 1:
+                sorted_topics = sorted(topic_stats.items(), key=lambda x: x[1]["percent_correct"], reverse=True)
+                best_tag, best_stats = sorted_topics[0]
+                worst_tag, worst_stats = sorted_topics[-1]
+                best_display = best_tag.replace("_", " ").title()
+                worst_display = worst_tag.replace("_", " ").title()
+
+                col_best, col_worst = st.columns(2)
+                col_best.metric(t("best_topic"), best_display, f"{best_stats['percent_correct']}%")
+                col_worst.metric(t("worst_topic"), worst_display, f"{worst_stats['percent_correct']}%")
+
+            # Bar chart comparing topics
+            if len(topic_stats) > 1:
+                import pandas as pd
+                chart_data = []
+                for tag, stats in topic_stats.items():
+                    tag_display = tag.replace("_", " ").title()
+                    chart_data.append({
+                        "topic": tag_display,
+                        t("correct_answers"): stats["correct"],
+                        t("incorrect_answers"): stats["incorrect"]
+                    })
+                df = pd.DataFrame(chart_data)
+                st.bar_chart(df, x="topic", y=[t("correct_answers"), t("incorrect_answers")], height=200)
+
+            st.divider()
+
     st.subheader(t("configuration"))
 
     if not questions:
@@ -1835,12 +2135,94 @@ def show_test_config():
     )
 
     st.write(t("topics_to_include"))
+
+    # Get topic statistics if user is logged in
+    topic_stats = {}
+    if _is_logged_in():
+        topic_stats = get_topic_statistics(st.session_state.user_id, test_id)
+
+    # Helper to get performance circle based on percent correct
+    def _get_performance_circle(pct):
+        if pct >= 95:
+            return "🟢"  # Green: excellent (>= 95% correct)
+        elif pct >= 80:
+            return "🟡"  # Yellow: good (80-95% correct)
+        elif pct >= 50:
+            return "🟠"  # Orange: needs work (50-80% correct)
+        else:
+            return "🔴"  # Red: struggling (< 50% correct)
+
     selected_tags = []
-    cols = st.columns(2)
-    for i, tag in enumerate(tags):
+    for tag in tags:
         tag_display = tag.replace("_", " ").title()
-        if cols[i % 2].checkbox(tag_display, value=True, key=f"tag_{tag}"):
-            selected_tags.append(tag)
+        stats = topic_stats.get(tag, {})
+
+        # Build label with colored circle and stats summary
+        if stats and stats.get("total", 0) > 0:
+            pct = stats.get("percent_correct", 0)
+            total = stats.get("total", 0)
+            circle = _get_performance_circle(pct)
+            label = f"{circle} {tag_display} — {pct}% ({total} {t('questions_answered').lower()})"
+        else:
+            label = f"⚪ {tag_display}"  # Grey circle: no stats yet
+
+        with st.expander(label, expanded=False):
+            col_check, col_practice, col_stats = st.columns([1, 1, 2])
+            with col_check:
+                if st.checkbox(t("select"), value=True, key=f"tag_{tag}"):
+                    selected_tags.append(tag)
+
+            with col_practice:
+                # Button to start a test focused on this topic only
+                if st.button(t("practice_topic"), key=f"practice_{tag}"):
+                    # Start test with only this topic selected
+                    logged_in = _is_logged_in()
+                    topic_questions = [q for q in questions if q["tag"] == tag]
+                    if topic_questions:
+                        stats_data = get_question_stats(st.session_state.user_id, test_id) if logged_in else None
+                        quiz_questions = select_balanced_questions(
+                            topic_questions, [tag], min(25, len(topic_questions)), stats_data
+                        )
+                        session_id = None
+                        if logged_in:
+                            session_id = create_session(
+                                st.session_state.user_id, test_id,
+                                0, len(quiz_questions),
+                            )
+                        st.session_state.questions = shuffle_question_options(quiz_questions)
+                        st.session_state.current_index = 0
+                        st.session_state.score = 0
+                        st.session_state.answered = False
+                        st.session_state.show_result = False
+                        st.session_state.selected_answer = None
+                        st.session_state.wrong_questions = []
+                        st.session_state.round_history = []
+                        st.session_state.current_round = 1
+                        st.session_state.current_test_id = test_id
+                        st.session_state.session_id = session_id
+                        st.session_state.view = "quiz"
+                        st.rerun()
+
+            with col_stats:
+                if stats and stats.get("total", 0) > 0:
+                    # Summary metrics
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric(t("correct_answers"), stats["correct"])
+                    m2.metric(t("incorrect_answers"), stats["incorrect"])
+                    m3.metric(t("percent_correct"), f"{stats['percent_correct']}%")
+
+                    # Progress over time chart
+                    history = stats.get("history", [])
+                    if len(history) > 1:
+                        import pandas as pd
+                        st.caption(t("progress_over_time"))
+                        df = pd.DataFrame(history)
+                        df["date"] = pd.to_datetime(df["date"])
+                        st.line_chart(df, x="date", y="percent", height=150)
+                    elif len(history) == 1:
+                        st.caption(f"{t('progress_over_time')}: {history[0]['percent']}%")
+                else:
+                    st.caption(t("no_stats_yet"))
 
     if not selected_tags:
         st.warning(t("select_at_least_one_topic"))
@@ -2078,103 +2460,249 @@ def show_quiz():
 
 
 def show_dashboard():
-    """Show the results dashboard."""
-    st.header(t("results_history"))
+    """Show the results dashboard with trophies, global stats, and test performance."""
+    st.header(t("dashboard"))
 
     user_id = st.session_state.user_id
-    sessions = get_user_sessions(user_id)
 
-    if not sessions:
-        st.info(t("no_results_yet"))
+    # Get user's test history
+    test_ids = get_user_test_ids(user_id)
+    if not test_ids:
+        st.info(t("no_tests_taken"))
         return
 
-    # --- Sessions summary ---
-    st.subheader(t("previous_sessions"))
+    # Get performance data for all tests
+    test_performance = get_tests_performance(user_id, test_ids)
+    session_count = get_user_session_count(user_id)
 
-    selected_session_ids = []
+    # Calculate global stats
+    total_questions = sum(p["total"] for p in test_performance.values())
+    total_correct = sum(p["correct"] for p in test_performance.values())
+    avg_score = round(100 * total_correct / total_questions, 1) if total_questions > 0 else 0
 
-    for s in sessions:
-        test_display = s["title"] or t("unknown_test")
-        pct = (s["score"] / s["total"]) * 100 if s["total"] > 0 else 0
-        date_str = s["date"][:16] if s["date"] else "—"
-        wrong_count = s["total"] - s["score"]
+    # --- Trophies Section ---
+    st.subheader(t("your_trophies"))
+    earned_trophies = _compute_user_trophies(user_id, test_performance, session_count)
+    earned_keys = {key for key, _, _ in earned_trophies}
 
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            label = f"{date_str} — {test_display}: {s['score']}/{s['total']} ({pct:.0f}%)"
-            if wrong_count > 0:
-                with st.expander(label):
-                    wrong_refs = get_session_wrong_answers(s["id"])
-                    if wrong_refs:
-                        by_test = {}
-                        for w in wrong_refs:
-                            by_test.setdefault(w["test_id"], set()).add(w["question_id"])
-                        wrong_questions = []
-                        for tid, q_ids in by_test.items():
-                            if tid:
-                                wrong_questions.extend(get_test_questions_by_ids(tid, list(q_ids)))
-                        for i, q in enumerate(wrong_questions, 1):
-                            tag_display = q["tag"].replace("_", " ").title()
-                            st.markdown(f"**{i}. {q['question']}**")
-                            st.caption(t("topic", name=tag_display))
-                            correct = q["options"][q["answer_index"]]
-                            st.success(t("correct_answer", answer=correct))
-                            st.info(t("explanation", text=q['explanation']))
-                            _render_material_refs(q["db_id"], st.session_state.get("current_test_id"))
-                            st.write("---")
-                    else:
-                        st.write(t("no_wrong_details"))
+    # Define all available trophies with descriptions
+    all_trophies = [
+        ("first_test", "🏆", t("trophy_first_test"), t("trophy_first_test_desc")),
+        ("5_tests", "📚", t("trophy_5_tests"), t("trophy_5_tests_desc")),
+        ("10_tests", "🎯", t("trophy_10_tests"), t("trophy_10_tests_desc")),
+        ("perfect", "🥇", t("trophy_perfect"), t("trophy_perfect_desc")),
+        ("excellent", "🥈", t("trophy_excellent"), t("trophy_excellent_desc")),
+        ("great", "🥉", t("trophy_great"), t("trophy_great_desc")),
+        ("topic_master", "🧠", t("trophy_topic_master"), t("trophy_topic_master_desc")),
+    ]
+
+    # Display all trophies in a grid
+    cols = st.columns(4)
+    for i, (key, icon, name, desc) in enumerate(all_trophies):
+        with cols[i % 4]:
+            is_earned = key in earned_keys
+            if is_earned:
+                st.markdown(f"<div style='text-align:center;font-size:2em;'>{icon}</div>", unsafe_allow_html=True)
+                st.caption(f"<div style='text-align:center;'><b>{name}</b></div>", unsafe_allow_html=True)
             else:
-                st.write(f"{label} ✓")
-        with col2:
-            if wrong_count > 0:
-                if st.checkbox(t("select_checkbox"), key=f"sel_session_{s['id']}", label_visibility="collapsed"):
-                    selected_session_ids.append(s["id"])
+                st.markdown(f"<div style='text-align:center;font-size:2em;opacity:0.3;'>🔒</div>", unsafe_allow_html=True)
+                st.caption(f"<div style='text-align:center;color:#888;'>{name}</div>", unsafe_allow_html=True)
+            st.caption(f"<div style='text-align:center;font-size:0.8em;color:#666;'>{desc}</div>", unsafe_allow_html=True)
 
-    # --- Practice from selected sessions ---
-    if selected_session_ids:
+    st.divider()
+
+    # --- Global Performance Section ---
+    st.subheader(t("global_performance"))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric(t("tests_taken"), len(test_ids))
+    col2.metric(t("total_questions"), total_questions)
+    col3.metric(t("correct_answers"), total_correct)
+    col4.metric(t("average_score"), f"{avg_score}%")
+
+    st.divider()
+
+    # --- Tests with Performance ---
+    st.subheader(t("your_tests"))
+
+    # Get test details for all tests the user has taken
+    all_tests = get_all_tests(user_id)
+    tests_by_id = {tt["id"]: tt for tt in all_tests}
+
+    # Helper to get performance circle
+    def _get_perf_circle(pct):
+        if pct >= 95:
+            return "🟢"
+        elif pct >= 80:
+            return "🟡"
+        elif pct >= 50:
+            return "🟠"
+        else:
+            return "🔴"
+
+    for test_id in test_ids:
+        test = tests_by_id.get(test_id)
+        if not test:
+            continue
+
+        perf = test_performance.get(test_id, {})
+        pct = perf.get("percent_correct", 0)
+        circle = _get_perf_circle(pct)
+
+        # Get topic statistics for this test
+        topic_stats = get_topic_statistics(user_id, test_id)
+        best_topic = None
+        worst_topic = None
+        if topic_stats:
+            sorted_topics = sorted(topic_stats.items(), key=lambda x: x[1]["percent_correct"], reverse=True)
+            if sorted_topics:
+                best_tag, best_stats = sorted_topics[0]
+                best_topic = (best_tag.replace("_", " ").title(), best_stats["percent_correct"])
+                if len(sorted_topics) > 1:
+                    worst_tag, worst_stats = sorted_topics[-1]
+                    worst_topic = (worst_tag.replace("_", " ").title(), worst_stats["percent_correct"], worst_tag)
+
+        with st.container(border=True):
+            col_info, col_actions = st.columns([3, 2])
+
+            with col_info:
+                st.markdown(f"### {circle} {test['title']}")
+                st.metric(t("overall_score"), f"{pct}%", label_visibility="collapsed")
+                total_answered = perf.get('total', 0)
+                correct_count = perf.get('correct', 0)
+                st.caption(f"{t('questions_answered')}: {total_answered} · {t('correct_answers')}: {correct_count}")
+
+                if best_topic:
+                    st.write(f"✅ **{t('best_topic')}:** {best_topic[0]} ({best_topic[1]}%)")
+                if worst_topic:
+                    st.write(f"⚠️ **{t('worst_topic')}:** {worst_topic[0]} ({worst_topic[1]}%)")
+
+            with col_actions:
+                # Retake test button
+                if st.button(t("retake_test"), key=f"retake_{test_id}", use_container_width=True):
+                    st.session_state.selected_test = test_id
+                    st.session_state.page = "Configurar Test"
+                    st.rerun()
+
+                # Practice worst topic button (if available)
+                if worst_topic:
+                    if st.button(t("practice_worst_topic"), key=f"practice_worst_{test_id}", use_container_width=True):
+                        _start_topic_focused_test(test_id, worst_topic[2])
+
+    # --- Programs Section ---
+    program_ids = get_user_program_ids(user_id)
+    if program_ids:
         st.divider()
-        all_wrong = []
-        for sid in selected_session_ids:
-            wrong_refs = get_session_wrong_answers(sid)
-            for w in wrong_refs:
-                all_wrong.append(w)
+        st.subheader(t("your_programs"))
 
-        seen = set()
-        unique_wrong = []
-        for w in all_wrong:
-            key = (w["test_id"], w["question_id"])
-            if key not in seen:
-                seen.add(key)
-                unique_wrong.append(w)
+        # Get program performance data
+        program_performance = get_programs_performance(user_id, program_ids)
 
-        st.write(t("wrong_selected", n=len(unique_wrong)))
-        if st.button(t("practice_wrong"), type="primary"):
-            _start_quiz_from_wrong(unique_wrong)
+        # Get program details
+        all_programs = get_all_programs(user_id)
+        programs_by_id = {p["id"]: p for p in all_programs}
+
+        for program_id in program_ids:
+            program = programs_by_id.get(program_id)
+            if not program:
+                continue
+
+            perf = program_performance.get(program_id, {})
+            pct = perf.get("percent_correct", 0)
+            circle = _get_perf_circle(pct)
+            total_answered = perf.get("total", 0)
+            correct_count = perf.get("correct", 0)
+            tests_taken = perf.get("tests_taken", 0)
+
+            with st.container(border=True):
+                col_info, col_actions = st.columns([3, 2])
+
+                with col_info:
+                    st.markdown(f"### {circle} {program['title']}")
+                    st.metric(t("overall_score"), f"{pct}%", label_visibility="collapsed")
+                    st.caption(f"{t('tests_taken')}: {tests_taken} · {t('questions_answered')}: {total_answered} · {t('correct_answers')}: {correct_count}")
+
+                with col_actions:
+                    # Go to program button
+                    if st.button(t("view_program"), key=f"view_prog_{program_id}", use_container_width=True):
+                        st.session_state.selected_program = program_id
+                        st.session_state.page = "Configurar Programa"
+                        st.rerun()
 
 
-def _start_quiz_from_wrong(wrong_refs):
-    """Start a quiz from a list of wrong question references."""
-    by_test = {}
-    for w in wrong_refs:
-        by_test.setdefault(w["test_id"], set()).add(w["question_id"])
+def _compute_user_trophies(user_id, test_performance, session_count):
+    """Compute trophies/achievements based on user's performance.
 
-    quiz_questions = []
-    test_id = None
-    for tid, q_ids in by_test.items():
-        if tid:
-            questions = get_test_questions_by_ids(tid, list(q_ids))
-            quiz_questions.extend(questions)
-            test_id = tid
+    Returns a list of tuples: (key, icon, name) for earned trophies.
+    """
+    trophies = []
 
-    if not quiz_questions:
+    # First test completed
+    if session_count >= 1:
+        trophies.append(("first_test", "🏆", t("trophy_first_test")))
+
+    # 5 tests completed
+    if session_count >= 5:
+        trophies.append(("5_tests", "📚", t("trophy_5_tests")))
+
+    # 10 tests completed
+    if session_count >= 10:
+        trophies.append(("10_tests", "🎯", t("trophy_10_tests")))
+
+    # Check for perfect scores, excellent, and great scores
+    has_perfect = False
+    has_excellent = False
+    has_great = False
+    topic_master_count = 0
+
+    for test_id, perf in test_performance.items():
+        pct = perf.get("percent_correct", 0)
+        if pct >= 100:
+            has_perfect = True
+        if pct >= 90:
+            has_excellent = True
+        if pct >= 80:
+            has_great = True
+
+        # Check for topic master (90%+ on all topics in a test)
+        topic_stats = get_topic_statistics(user_id, test_id)
+        if topic_stats:
+            all_topics_excellent = all(s["percent_correct"] >= 90 for s in topic_stats.values())
+            if all_topics_excellent and len(topic_stats) >= 2:
+                topic_master_count += 1
+
+    if has_perfect:
+        trophies.append(("perfect", "🥇", t("trophy_perfect")))
+    if has_excellent and not has_perfect:
+        trophies.append(("excellent", "🥈", t("trophy_excellent")))
+    if has_great and not has_excellent:
+        trophies.append(("great", "🥉", t("trophy_great")))
+    if topic_master_count > 0:
+        trophies.append(("topic_master", "🧠", t("trophy_topic_master")))
+
+    return trophies
+
+
+def _start_topic_focused_test(test_id, tag):
+    """Start a test focused on a specific topic."""
+    questions = get_test_questions(test_id)
+    topic_questions = [q for q in questions if q["tag"] == tag]
+
+    if not topic_questions:
         return
 
-    random.shuffle(quiz_questions)
-    tid = test_id or 0
-    session_id = create_session(
-        st.session_state.user_id, tid, 0, len(quiz_questions),
+    logged_in = _is_logged_in()
+    stats_data = get_question_stats(st.session_state.user_id, test_id) if logged_in else None
+    quiz_questions = select_balanced_questions(
+        topic_questions, [tag], min(25, len(topic_questions)), stats_data
     )
+
+    session_id = None
+    if logged_in:
+        session_id = create_session(
+            st.session_state.user_id, test_id,
+            0, len(quiz_questions),
+        )
+
     st.session_state.questions = shuffle_question_options(quiz_questions)
     st.session_state.current_index = 0
     st.session_state.score = 0
@@ -2184,9 +2712,9 @@ def _start_quiz_from_wrong(wrong_refs):
     st.session_state.wrong_questions = []
     st.session_state.round_history = []
     st.session_state.current_round = 1
-    st.session_state.current_test_id = tid
-    st.session_state.current_session_id = session_id
-    st.session_state.session_score_saved = False
+    st.session_state.current_test_id = test_id
+    st.session_state.session_id = session_id
+    st.session_state.view = "quiz"
     st.session_state.quiz_started = True
     st.session_state.page = "Tests"
     st.rerun()
@@ -2390,9 +2918,10 @@ def show_test_editor():
         key="edit_lang",
         disabled=meta_disabled,
     )
-    visibility_options = ["public", "private", "hidden"]
+    visibility_options = ["public", "restricted", "private", "hidden"]
     visibility_labels = {
         "public": t("visibility_public"),
+        "restricted": t("visibility_restricted"),
         "private": t("visibility_private"),
         "hidden": t("visibility_hidden"),
     }
@@ -2440,14 +2969,6 @@ def show_test_editor():
                 new_url = ""
                 if mat["material_type"] in ("youtube", "url"):
                     new_url = st.text_input(t("url"), value=mat["url"] or "", key=f"edit_mat_url_{mat['id']}")
-                new_pause = ""
-                if mat["material_type"] == "youtube":
-                    new_pause = st.text_input(
-                        t("pause_times_label"),
-                        value=_format_pause_times(mat.get("pause_times", "")),
-                        key=f"edit_mat_pause_{mat['id']}",
-                        help=t("pause_times_help"),
-                    )
                 if mat["material_type"] == "image" and mat["file_data"]:
                     st.image(mat["file_data"], width=200)
                 elif mat["material_type"] == "pdf" and mat["file_data"]:
@@ -2461,8 +2982,7 @@ def show_test_editor():
                 cols = st.columns([1, 1, 1, 1, 1, 1] if is_yt else [1, 1, 1])
                 with cols[0]:
                     if st.button(t("save_material"), key=f"save_mat_{mat['id']}", type="primary"):
-                        pause_json = _parse_pause_times(new_pause) if is_yt else ""
-                        update_test_material(mat["id"], new_title.strip(), new_url.strip(), pause_times=pause_json)
+                        update_test_material(mat["id"], new_title.strip(), new_url.strip())
                         st.rerun()
                 with cols[1]:
                     if st.button(t("generate"), key=f"gen_mat_{mat['id']}"):
@@ -2642,14 +3162,21 @@ def show_test_editor():
     all_tags = get_test_tags(test_id)
 
     with st.expander(t("questions_header", n=len(questions)), expanded=False):
+        # Show import success message if any
+        if st.session_state.get("import_q_success"):
+            st.success(st.session_state.pop("import_q_success"))
+
         if not read_only:
-            col_add_q, col_bulk_q = st.columns([1, 1])
+            col_add_q, col_import_q, col_bulk_q = st.columns([1, 1, 1])
             with col_add_q:
                 if st.button(t("add_question"), use_container_width=True):
                     next_num = get_next_question_num(test_id)
                     default_tag = all_tags[0] if all_tags else "general"
                     add_question(test_id, next_num, default_tag, t("new_question_text"), [t("option_a"), t("option_b"), t("option_c"), t("option_d")], 0, "")
                     st.rerun()
+            with col_import_q:
+                if st.button(t("import_questions"), use_container_width=True):
+                    _import_questions_dialog(test_id, materials)
             with col_bulk_q:
                 q_bulk_delete = st.toggle(t("bulk_delete_mode"), key="q_bulk_delete_mode")
                 if q_bulk_delete:
@@ -2801,9 +3328,15 @@ def show_test_editor():
         collabs = get_collaborators(test_id)
         if collabs:
             for c in collabs:
-                col_email, col_role, col_del = st.columns([3, 2, 0.5])
+                col_email, col_status, col_role, col_del = st.columns([2.5, 1, 2, 0.5])
                 with col_email:
                     st.write(c["email"])
+                with col_status:
+                    status = c.get("status", "accepted")
+                    if status == "pending":
+                        st.caption(f"⏳ {t('status_pending')}")
+                    else:
+                        st.caption(f"✓ {t('status_accepted')}")
                 with col_role:
                     role_options = ["student", "guest", "reviewer", "admin"]
                     role_labels = {"student": t("role_student"), "guest": t("role_guest"), "reviewer": t("role_reviewer"), "admin": t("role_admin")}
@@ -2836,7 +3369,7 @@ def show_test_editor():
                     st.warning(t("cannot_invite_self"))
                 else:
                     add_collaborator(test_id, inv_email.strip(), inv_role)
-                    st.success(t("collaborator_added"))
+                    st.success(t("invitation_sent"))
                     st.rerun()
 
     st.divider()
@@ -2905,6 +3438,11 @@ def _is_global_admin():
 def _can_create_tests():
     """Check if user can create tests. Students cannot create tests."""
     return _get_global_role() in ("free", "premium", "admin")
+
+
+def _can_create_programs():
+    """Check if user can create programs. Only premium and admin users can create programs."""
+    return _get_global_role() in ("premium", "admin")
 
 
 def show_profile():
@@ -2976,10 +3514,9 @@ def show_admin_panel():
 
     st.write(t("total_users", n=len(filtered_users)))
 
-    # Role options
-    role_options = ["student", "free", "premium", "admin"]
+    # Role options (student role removed from global roles - only applies at test/program level)
+    role_options = ["free", "premium", "admin"]
     role_labels = {
-        "student": t("global_role_student"),
         "free": t("global_role_free"),
         "premium": t("global_role_premium"),
         "admin": t("global_role_admin"),
@@ -2987,28 +3524,35 @@ def show_admin_panel():
 
     # Display users in a table-like format
     for user in filtered_users:
-        with st.container(border=True):
-            col_info, col_role = st.columns([3, 2])
+        display = user["display_name"] or user["email"]
+        current_role = user["global_role"] or "free"
+        # Handle legacy 'student' role by treating it as 'free'
+        if current_role == "student":
+            current_role = "free"
+        current_idx = role_options.index(current_role) if current_role in role_options else 0
+
+        with st.form(key=f"user_role_form_{user['id']}"):
+            col_info, col_role, col_save = st.columns([3, 2, 1])
             with col_info:
-                display = user["display_name"] or user["email"]
                 st.write(f"**{display}**")
                 if user["display_name"]:
                     st.caption(user["email"])
             with col_role:
-                current_role = user["global_role"] or "free"
-                current_idx = role_options.index(current_role) if current_role in role_options else 1
                 new_role = st.selectbox(
                     t("role"),
                     options=role_options,
                     index=current_idx,
                     format_func=lambda x: role_labels.get(x, x),
-                    key=f"role_{user['id']}",
                     label_visibility="collapsed",
                 )
-                if new_role != current_role:
-                    set_user_global_role(user["id"], new_role)
-                    st.success(t("role_updated", user=display, role=role_labels[new_role]))
-                    st.rerun()
+            with col_save:
+                st.write("")  # Spacer for alignment
+                submitted = st.form_submit_button("💾", help=t("save"))
+
+            if submitted:
+                set_user_global_role(user["id"], new_role)
+                st.success(t("role_updated", user=display, role=role_labels[new_role]))
+                st.rerun()
 
 
 def _toggle_bulk_program(prog_id):
@@ -3021,11 +3565,48 @@ def _toggle_bulk_program(prog_id):
         st.session_state.bulk_delete_programs.add(prog_id)
 
 
+def _get_program_export_data(program_id):
+    """Generate export data for a program including its tests. Returns (json_string, title)."""
+    import json as _json
+    prog = get_program(program_id)
+    if not prog:
+        return "{}", "unknown"
+
+    # Get program tests with their details
+    prog_tests = get_program_tests(program_id)
+    export_tests = []
+    for pt in prog_tests:
+        # Get full test data for each test in the program
+        test_export_data, _ = _get_test_export_data(pt["id"])
+        test_data = _json.loads(test_export_data)
+        # Add program-specific visibility
+        test_data["program_visibility"] = pt.get("program_visibility", "public")
+        export_tests.append(test_data)
+
+    # Get program collaborators
+    export_collabs = []
+    for c in get_program_collaborators(program_id):
+        export_collabs.append({"email": c["email"], "role": c["role"]})
+
+    export_data = {
+        "title": prog["title"],
+        "description": prog.get("description", ""),
+        "visibility": prog.get("visibility", "public"),
+        "collaborators": export_collabs,
+        "tests": export_tests,
+    }
+    return _json.dumps(export_data, ensure_ascii=False, indent=2), prog["title"]
+
+
 def _render_program_card(prog, user_id, has_access=True, prefix="", bulk_delete_mode=False):
-    """Render a single program card."""
+    """Render a single program card with select/edit/export buttons."""
+    is_owner = prog.get("owner_id") == user_id
+    prog_role = get_user_role_for_program(prog["id"], user_id) if not is_owner else None
+    can_edit = _is_global_admin() or is_owner or prog_role in ("reviewer", "admin")
+
     with st.container(border=True):
         if bulk_delete_mode:
-            col_check, col_info, col_btn = st.columns([0.5, 4, 1])
+            col_check, col_info, col_btn = st.columns([0.5, 4, 1.5])
             with col_check:
                 # Initialize set if needed
                 if "bulk_delete_programs" not in st.session_state:
@@ -3034,7 +3615,7 @@ def _render_program_card(prog, user_id, has_access=True, prefix="", bulk_delete_
                 st.checkbox("", value=is_selected, key=f"{prefix}bulk_select_prog_{prog['id']}",
                            label_visibility="collapsed", on_change=_toggle_bulk_program, args=(prog["id"],))
         else:
-            col_info, col_btn = st.columns([4, 1])
+            col_info, col_btn = st.columns([3.5, 2])
         with col_info:
             title_display = prog["title"]
             if prog.get("visibility") == "private" and not has_access:
@@ -3044,21 +3625,36 @@ def _render_program_card(prog, user_id, has_access=True, prefix="", bulk_delete_
                 st.write(prog["description"])
             st.caption(t("n_tests", n=prog['test_count']))
         with col_btn:
-            if has_access:
-                if st.button(t("select"), key=f"{prefix}prog_sel_{prog['id']}", use_container_width=True):
-                    st.session_state.selected_program = prog["id"]
-                    st.session_state.page = "Configurar Programa"
-                    st.rerun()
-            else:
-                st.button(t("select"), key=f"{prefix}prog_sel_{prog['id']}", use_container_width=True, disabled=True)
-            is_owner = prog.get("owner_id") == user_id
-            prog_role = get_user_role_for_program(prog["id"], user_id) if not is_owner else None
-            can_edit = _is_global_admin() or is_owner or prog_role in ("guest", "reviewer", "admin")
+            # Show buttons in a row: Select, Edit (if can_edit), Export (if can_edit)
+            btn_cols = st.columns(3 if can_edit else 1)
+            col_idx = 0
+            with btn_cols[col_idx]:
+                if has_access:
+                    if st.button("▶️", key=f"{prefix}prog_sel_{prog['id']}", use_container_width=True, help=t("select")):
+                        st.session_state.selected_program = prog["id"]
+                        st.session_state.page = "Configurar Programa"
+                        st.rerun()
+                else:
+                    st.button("▶️", key=f"{prefix}prog_sel_{prog['id']}", use_container_width=True, disabled=True, help=t("select"))
             if can_edit:
-                if st.button(t("edit"), key=f"{prefix}prog_edit_{prog['id']}", use_container_width=True):
-                    st.session_state.editing_program_id = prog["id"]
-                    st.session_state.page = "Editar Programa"
-                    st.rerun()
+                col_idx += 1
+                with btn_cols[col_idx]:
+                    if st.button("✏️", key=f"{prefix}prog_edit_{prog['id']}", use_container_width=True, help=t("edit_program")):
+                        st.session_state.editing_program_id = prog["id"]
+                        st.session_state.page = "Editar Programa"
+                        st.rerun()
+                col_idx += 1
+                with btn_cols[col_idx]:
+                    export_data, export_title = _get_program_export_data(prog["id"])
+                    st.download_button(
+                        "⬇️",
+                        data=export_data,
+                        file_name=f"{export_title}.json",
+                        mime="application/json",
+                        key=f"{prefix}prog_export_{prog['id']}",
+                        use_container_width=True,
+                        help=t("export_program"),
+                    )
 
 
 def show_programs():
@@ -3070,7 +3666,31 @@ def show_programs():
 
     st.header(t("programs_header"))
 
-    # Admin bulk delete mode
+    # --- Pending Program Invitations Section ---
+    invitations = get_pending_invitations(user_id)
+    program_invitations = invitations["programs"]
+
+    if program_invitations:
+        with st.expander(f"📩 {t('pending_invitations')} ({len(program_invitations)})", expanded=True):
+            for inv in program_invitations:
+                with st.container(border=True):
+                    col_info, col_actions = st.columns([3, 1])
+                    with col_info:
+                        st.markdown(f"**{t('program_invitation')}:** {inv['title']}")
+                        st.caption(f"{t('invited_by', name=inv['inviter_name'])} {t('invited_as', role=inv['role'])}")
+                    with col_actions:
+                        c1, c2 = st.columns(2)
+                        if c1.button("✓", key=f"accept_prog_cat_{inv['program_id']}", help=t("accept_invitation")):
+                            accept_program_invitation(inv['program_id'], user_id)
+                            st.success(t("invitation_accepted"))
+                            st.rerun()
+                        if c2.button("✕", key=f"decline_prog_cat_{inv['program_id']}", help=t("decline_invitation")):
+                            decline_program_invitation(inv['program_id'], user_id)
+                            st.info(t("invitation_declined"))
+                            st.rerun()
+        st.divider()
+
+    # Admin bulk delete mode and create button
     bulk_delete_mode = False
     if _is_global_admin():
         col_create, col_bulk = st.columns([1, 1])
@@ -3083,7 +3703,7 @@ def show_programs():
             if bulk_delete_mode:
                 if "bulk_delete_programs" not in st.session_state:
                     st.session_state.bulk_delete_programs = set()
-    else:
+    elif _can_create_programs():
         if st.button(t("create_program"), type="secondary"):
             st.session_state.page = "Crear Programa"
             st.rerun()
@@ -3106,7 +3726,7 @@ def show_programs():
     accessible_ids = shared_prog_ids | {p["id"] for p in programs if p.get("owner_id") == user_id}
 
     def _prog_has_access(p):
-        if p.get("visibility", "public") == "public":
+        if p.get("visibility", "public") in ("public", "restricted"):
             return True
         return p["id"] in accessible_ids
 
@@ -3135,6 +3755,14 @@ def show_programs():
 
 def show_create_program():
     """Show create program form."""
+    # Only premium and admin users can create programs
+    if not _can_create_programs():
+        st.error(t("no_permission"))
+        if st.button(t("back_to_programs")):
+            st.session_state.page = "Programas"
+            st.rerun()
+        return
+
     st.header(t("create_new_program"))
 
     if st.button(t("back")):
@@ -3194,9 +3822,10 @@ def show_program_editor():
     new_title = st.text_input(t("title"), value=prog["title"], key="edit_prog_title", disabled=meta_disabled)
     new_desc = st.text_area(t("description"), value=prog["description"] or "", key="edit_prog_desc", disabled=meta_disabled)
 
-    visibility_options = ["public", "private", "hidden"]
+    visibility_options = ["public", "restricted", "private", "hidden"]
     visibility_labels = {
         "public": t("visibility_public"),
+        "restricted": t("visibility_restricted"),
         "private": t("visibility_private"),
         "hidden": t("visibility_hidden"),
     }
@@ -3224,19 +3853,48 @@ def show_program_editor():
     # --- Tests in program ---
     st.subheader(t("tests_included"))
 
+    # Visibility labels for program access
+    visibility_labels = {
+        "public": t("visibility_public"),
+        "restricted": t("visibility_restricted"),
+        "private": t("visibility_private"),
+        "hidden": t("visibility_hidden"),
+    }
+
     prog_tests = get_program_tests(program_id)
     if prog_tests:
         for pt in prog_tests:
             if not meta_disabled:
-                col_info, col_rm = st.columns([5, 1])
+                col_info, col_vis, col_rm = st.columns([3, 2, 0.5])
                 with col_info:
                     st.write(f"**{pt['title']}** ({t('n_questions', n=pt['question_count'])})")
+                with col_vis:
+                    # Get available visibility options based on test's base visibility
+                    test_visibility = pt.get("test_visibility", "public")
+                    available_options = get_visibility_options_for_test(test_visibility)
+                    current_visibility = pt.get("program_visibility", test_visibility)
+                    # Ensure current visibility is in available options
+                    if current_visibility not in available_options:
+                        current_visibility = available_options[0]
+                    current_idx = available_options.index(current_visibility)
+                    new_visibility = st.selectbox(
+                        t("program_visibility"),
+                        options=available_options,
+                        index=current_idx,
+                        format_func=lambda x: visibility_labels.get(x, x),
+                        key=f"prog_visibility_{pt['id']}",
+                        label_visibility="collapsed",
+                    )
+                    if new_visibility != current_visibility:
+                        update_program_test_visibility(program_id, pt["id"], new_visibility)
+                        st.rerun()
                 with col_rm:
-                    if st.button(t("remove"), key=f"rm_pt_{pt['id']}"):
+                    if st.button("🗑️", key=f"rm_pt_{pt['id']}"):
                         remove_test_from_program(program_id, pt["id"])
                         st.rerun()
             else:
-                st.write(f"**{pt['title']}** ({t('n_questions', n=pt['question_count'])})")
+                visibility_label = visibility_labels.get(pt.get("program_visibility", "public"), t("visibility_public"))
+                st.write(f"**{pt['title']}** ({t('n_questions', n=pt['question_count'])}) - {visibility_label}")
     else:
         st.info(t("no_tests_in_program"))
 
@@ -3244,18 +3902,46 @@ def show_program_editor():
     if not meta_disabled:
         all_tests = get_all_tests(st.session_state.user_id)
         current_test_ids = {pt["id"] for pt in prog_tests}
-        available_tests = [tt for tt in all_tests if tt["id"] not in current_test_ids]
+        # Only show tests the user has admin or reviewer access to
+        available_tests = []
+        for tt in all_tests:
+            if tt["id"] in current_test_ids:
+                continue
+            # Check if user is owner or has admin/reviewer role
+            if tt.get("owner_id") == st.session_state.user_id:
+                available_tests.append(tt)
+            else:
+                user_role = get_user_role_for_test(tt["id"], st.session_state.user_id)
+                if user_role in ("admin", "reviewer"):
+                    available_tests.append(tt)
 
         if available_tests:
             st.write(t("add_test_label"))
-            test_options = {tt["id"]: f"{tt['title']} ({t('n_questions_abbrev', n=tt['question_count'])})" for tt in available_tests}
-            selected_test_id = st.selectbox(
-                t("test_label"), options=list(test_options.keys()),
-                format_func=lambda x: test_options[x],
-                key="add_prog_test",
-            )
+            # Create a dict mapping test_id to test info for visibility lookup
+            test_info_map = {tt["id"]: tt for tt in available_tests}
+            col_test, col_vis_add = st.columns([3, 2])
+            with col_test:
+                test_options = {tt["id"]: f"{tt['title']} ({t('n_questions_abbrev', n=tt['question_count'])})" for tt in available_tests}
+                selected_test_id = st.selectbox(
+                    t("test_label"), options=list(test_options.keys()),
+                    format_func=lambda x: test_options[x],
+                    key="add_prog_test",
+                    label_visibility="collapsed",
+                )
+            with col_vis_add:
+                # Get visibility options based on selected test's base visibility
+                selected_test_visibility = test_info_map[selected_test_id].get("visibility", "public")
+                add_visibility_options = get_visibility_options_for_test(selected_test_visibility)
+                add_program_visibility = st.selectbox(
+                    t("program_visibility"),
+                    options=add_visibility_options,
+                    index=0,
+                    format_func=lambda x: visibility_labels.get(x, x),
+                    key="add_prog_test_visibility",
+                    label_visibility="collapsed",
+                )
             if st.button(t("add_test_btn")):
-                add_test_to_program(program_id, selected_test_id)
+                add_test_to_program(program_id, selected_test_id, add_program_visibility)
                 st.rerun()
 
     st.divider()
@@ -3266,9 +3952,15 @@ def show_program_editor():
         collabs = get_program_collaborators(program_id)
         if collabs:
             for c in collabs:
-                col_email, col_role, col_del = st.columns([3, 2, 0.5])
+                col_email, col_status, col_role, col_del = st.columns([2.5, 1, 2, 0.5])
                 with col_email:
                     st.write(c["email"])
+                with col_status:
+                    status = c.get("status", "accepted")
+                    if status == "pending":
+                        st.caption(f"⏳ {t('status_pending')}")
+                    else:
+                        st.caption(f"✓ {t('status_accepted')}")
                 with col_role:
                     role_options = ["student", "guest", "reviewer", "admin"]
                     role_labels = {"student": t("role_student"), "guest": t("role_guest"), "reviewer": t("role_reviewer"), "admin": t("role_admin")}
@@ -3301,7 +3993,7 @@ def show_program_editor():
                     st.warning(t("cannot_invite_self"))
                 else:
                     add_program_collaborator(program_id, inv_email.strip(), inv_role)
-                    st.success(t("collaborator_added"))
+                    st.success(t("invitation_sent"))
                     st.rerun()
 
     st.divider()
@@ -3341,9 +4033,9 @@ def show_program_config():
         st.error(t("program_not_found"))
         return
 
-    # Access control for private/hidden programs
+    # Access control for private/hidden programs (restricted and public are open to everyone)
     visibility = prog.get("visibility", "public")
-    if visibility != "public":
+    if visibility not in ("public", "restricted"):
         logged_in_uid = st.session_state.get("user_id")
         has_prog_access = (
             logged_in_uid and (
@@ -3364,21 +4056,183 @@ def show_program_config():
     tags = get_program_tags(program_id)
     prog_tests = get_program_tests(program_id)
 
+    # Check if user can edit
+    logged_in_uid = st.session_state.get("user_id")
+    is_owner = prog.get("owner_id") == logged_in_uid
+    prog_role = get_user_role_for_program(program_id, logged_in_uid) if logged_in_uid and not is_owner else None
+    can_edit_program = _is_global_admin() or is_owner or prog_role in ("reviewer", "admin")
+
+    # Get performance data for all tests in the program
+    logged_in = _is_logged_in()
+    test_ids = [pt["id"] for pt in prog_tests]
+    test_performance = get_tests_performance(logged_in_uid, test_ids) if logged_in else {}
+
+    # Helper to get performance circle
+    def _get_perf_circle(pct):
+        if pct >= 95:
+            return "🟢"  # Green: excellent
+        elif pct >= 80:
+            return "🟡"  # Yellow: good
+        elif pct >= 50:
+            return "🟠"  # Orange: needs work
+        else:
+            return "🔴"  # Red: struggling
+
     st.header(prog["title"])
     if prog.get("description"):
         st.write(prog["description"])
 
     st.caption(t("n_tests_n_questions", nt=len(prog_tests), nq=len(questions)))
 
-    with st.expander(t("tests_included")):
-        for pt in prog_tests:
-            st.write(f"- **{pt['title']}** ({t('n_questions', n=pt['question_count'])})")
+    # Tests included section with performance and action buttons
+    st.subheader(t("tests_included"))
+    visible_tests_count = 0
+    for pt in prog_tests:
+        test_id = pt["id"]
+        program_visibility = pt.get("program_visibility", "public")
 
-    if st.button(t("back_to_programs")):
-        if "selected_program" in st.session_state:
-            del st.session_state.selected_program
-        st.session_state.page = "Programas"
-        st.rerun()
+        # Check if user can see this test based on effective visibility
+        test_data = get_test(test_id)
+        test_owner_id = test_data.get("owner_id") if test_data else None
+        test_base_visibility = test_data.get("visibility", "public") if test_data else "public"
+
+        # Compute effective visibility (the more restrictive of test base and program visibility)
+        effective_visibility = get_effective_visibility(test_base_visibility, program_visibility)
+
+        # Check direct access (for private/hidden visibility)
+        has_direct_access = (
+            _is_global_admin()
+            or test_owner_id == logged_in_uid
+            or has_direct_test_access(test_id, logged_in_uid)
+        )
+
+        # For hidden tests, skip unless user has direct access
+        if effective_visibility == "hidden" and not has_direct_access:
+            continue  # Skip this hidden test
+
+        visible_tests_count += 1
+        perf = test_performance.get(test_id, {})
+        pct = perf.get("percent_correct", 0)
+        total_answered = perf.get("total", 0)
+
+        # Check edit permission for this specific test
+        test_role = get_user_role_for_test(test_id, logged_in_uid) if logged_in_uid else None
+        can_edit_test = _is_global_admin() or test_owner_id == logged_in_uid or test_role in ("reviewer", "admin")
+
+        # Determine if user can access this test based on effective visibility
+        can_access_test = (
+            effective_visibility in ("public", "restricted")
+            or has_direct_access
+        )
+
+        with st.container(border=True):
+            # Title row with performance circle and buttons
+            col_info, col_btns = st.columns([3, 2])
+
+            with col_info:
+                # Title with performance circle and visibility indicator
+                if logged_in and total_answered > 0:
+                    circle = _get_perf_circle(pct)
+                    title_display = f"{circle} **{pt['title']}**"
+                elif logged_in:
+                    title_display = f"⚪ **{pt['title']}**"
+                else:
+                    title_display = f"**{pt['title']}**"
+
+                # Add visibility indicator for restricted/private tests
+                if effective_visibility == "private" and not has_direct_access:
+                    title_display += " 🔒"
+                elif effective_visibility == "restricted":
+                    title_display += " 🔓"
+
+                st.markdown(title_display)
+                st.caption(t("n_questions", n=pt["question_count"]))
+
+            with col_btns:
+                # Action buttons: View, Edit (if can_edit), Export (if can_edit)
+                num_btns = 3 if can_edit_test else 1
+                btn_cols = st.columns(num_btns)
+                btn_idx = 0
+
+                with btn_cols[btn_idx]:
+                    # Disable button for private tests without access
+                    btn_disabled = not can_access_test
+                    btn_help = t("select") if can_access_test else t("test_private_no_access")
+                    if st.button("▶️", key=f"prog_view_test_{test_id}", use_container_width=True, help=btn_help, disabled=btn_disabled):
+                        st.session_state.selected_test = test_id
+                        st.session_state.test_program_visibility = program_visibility  # For material visibility
+                        st.session_state.page = "Configurar Test"
+                        st.rerun()
+
+                if can_edit_test:
+                    btn_idx += 1
+                    with btn_cols[btn_idx]:
+                        if st.button("✏️", key=f"prog_edit_test_{test_id}", use_container_width=True, help=t("edit_test")):
+                            st.session_state.editing_test_id = test_id
+                            st.rerun()
+                    btn_idx += 1
+                    with btn_cols[btn_idx]:
+                        export_data, export_title = _get_test_export_data(test_id)
+                        st.download_button(
+                            "⬇️",
+                            data=export_data,
+                            file_name=f"{export_title}.json",
+                            mime="application/json",
+                            key=f"prog_export_test_{test_id}",
+                            use_container_width=True,
+                            help=t("export_json"),
+                        )
+
+            # Expandable performance details
+            if logged_in and total_answered > 0:
+                with st.expander(t("your_progress")):
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric(t("total_answered"), total_answered)
+                    m2.metric(t("correct_answers"), perf.get("correct", 0))
+                    m3.metric(t("percent_correct"), f"{pct}%")
+
+                    # Get topic stats for this test
+                    topic_stats = get_topic_statistics(logged_in_uid, test_id)
+                    if topic_stats and len(topic_stats) > 1:
+                        sorted_topics = sorted(topic_stats.items(), key=lambda x: x[1]["percent_correct"], reverse=True)
+                        best_tag, best_stats = sorted_topics[0]
+                        worst_tag, worst_stats = sorted_topics[-1]
+                        best_display = best_tag.replace("_", " ").title()
+                        worst_display = worst_tag.replace("_", " ").title()
+                        col_best, col_worst = st.columns(2)
+                        col_best.metric(t("best_topic"), best_display, f"{best_stats['percent_correct']}%")
+                        col_worst.metric(t("worst_topic"), worst_display, f"{worst_stats['percent_correct']}%")
+
+    if visible_tests_count == 0:
+        st.info(t("no_tests_in_program"))
+
+    # Action buttons row
+    btn_cols = st.columns(4 if can_edit_program else 2)
+    col_idx = 0
+    with btn_cols[col_idx]:
+        if st.button(t("back_to_programs"), use_container_width=True):
+            if "selected_program" in st.session_state:
+                del st.session_state.selected_program
+            st.session_state.page = "Programas"
+            st.rerun()
+    col_idx += 1
+    if can_edit_program:
+        with btn_cols[col_idx]:
+            if st.button(f"✏️ {t('edit_program')}", use_container_width=True):
+                st.session_state.editing_program_id = program_id
+                st.session_state.page = "Editar Programa"
+                st.rerun()
+        col_idx += 1
+        with btn_cols[col_idx]:
+            export_data, export_title = _get_program_export_data(program_id)
+            st.download_button(
+                t("export_json"),
+                data=export_data,
+                file_name=f"{export_title}.json",
+                mime="application/json",
+                key="export_program_json",
+                use_container_width=True,
+            )
 
     if not questions:
         st.warning(t("no_program_questions"))
@@ -3456,8 +4310,7 @@ def main():
         if logged_in:
             avatar_bytes = st.session_state.get("avatar_bytes")
             display_name = st.session_state.get("display_name", st.session_state.username)
-            popover_label = "👤"
-            with st.popover(popover_label):
+            with st.popover("👤"):
                 if avatar_bytes:
                     st.image(avatar_bytes, width=60)
                 st.write(f"**{display_name}**")
@@ -3492,7 +4345,7 @@ def main():
 
         st.markdown("---")
         nav_items = [("📝", "Tests", t("tests"))]
-        if logged_in and _is_premium_or_admin():
+        if logged_in:
             nav_items.append(("📊", "Dashboard", t("dashboard")))
             nav_items.append(("📚", "Programas", t("programs")))
         if logged_in and _is_global_admin():

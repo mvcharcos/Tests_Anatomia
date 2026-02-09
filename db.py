@@ -115,6 +115,7 @@ def init_db():
             user_email TEXT NOT NULL,
             user_id INTEGER,
             role TEXT NOT NULL CHECK(role IN ('student','guest','reviewer','admin')),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','declined')),
             invited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE,
             UNIQUE(program_id, user_email)
@@ -125,6 +126,7 @@ def init_db():
             user_email TEXT NOT NULL,
             user_id INTEGER,
             role TEXT NOT NULL CHECK(role IN ('student','guest','reviewer','admin')),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','declined')),
             invited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (test_id) REFERENCES tests(id) ON DELETE CASCADE,
             UNIQUE(test_id, user_email)
@@ -155,6 +157,10 @@ def init_db():
     if "global_role" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN global_role TEXT DEFAULT 'free'")
         conn.commit()
+
+    # Migrate any existing 'student' global roles to 'free' (student role removed from global roles)
+    conn.execute("UPDATE users SET global_role = 'free' WHERE global_role = 'student'")
+    conn.commit()
 
     # Add pause_times and questions_per_pause to test_materials
     cursor = conn.execute("PRAGMA table_info(test_materials)")
@@ -230,6 +236,38 @@ def init_db():
     """)
     conn.commit()
 
+    # Add status column to test_collaborators for invitation confirmation
+    cursor = conn.execute("PRAGMA table_info(test_collaborators)")
+    tc_cols = [row[1] for row in cursor.fetchall()]
+    if "status" not in tc_cols:
+        conn.execute("ALTER TABLE test_collaborators ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'")
+        conn.commit()
+
+    # Add status column to program_collaborators for invitation confirmation
+    cursor = conn.execute("PRAGMA table_info(program_collaborators)")
+    pc_cols = [row[1] for row in cursor.fetchall()]
+    if "status" not in pc_cols:
+        conn.execute("ALTER TABLE program_collaborators ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'")
+        conn.commit()
+
+    # Add program_visibility column to program_tests for per-test visibility override
+    cursor = conn.execute("PRAGMA table_info(program_tests)")
+    pt_cols = [row[1] for row in cursor.fetchall()]
+    if "program_visibility" not in pt_cols:
+        # Check if old elevated_role column exists (migration from role-based to visibility-based)
+        if "elevated_role" in pt_cols:
+            conn.execute("ALTER TABLE program_tests ADD COLUMN program_visibility TEXT")
+            # Migrate: set program_visibility based on test's base visibility (default to test's visibility)
+            conn.execute("""
+                UPDATE program_tests SET program_visibility = (
+                    SELECT COALESCE(t.visibility, 'public') FROM tests t WHERE t.id = program_tests.test_id
+                )
+            """)
+            conn.commit()
+        else:
+            conn.execute("ALTER TABLE program_tests ADD COLUMN program_visibility TEXT DEFAULT 'public'")
+            conn.commit()
+
     conn.close()
 
     # Import JSON tests and backfill references
@@ -302,14 +340,14 @@ def _import_json_file(conn, file_path):
         if old_id is not None:
             mat_id_map[old_id] = mat_cursor.lastrowid
 
-    # Import collaborators
+    # Import collaborators (as pending invitations)
     collabs_data = data.get("collaborators", []) if isinstance(data, dict) else []
     for collab in collabs_data:
         email = collab.get("email", "").strip()
         role = collab.get("role", "guest")
         if email and role in ("student", "guest", "reviewer", "admin"):
             conn.execute(
-                "INSERT OR IGNORE INTO test_collaborators (test_id, user_email, role) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO test_collaborators (test_id, user_email, role, status) VALUES (?, ?, ?, 'pending')",
                 (test_id, email, role),
             )
 
@@ -382,13 +420,13 @@ def import_test_from_json(owner_id, json_content):
         if old_id is not None:
             mat_id_map[old_id] = mat_cursor.lastrowid
 
-    # Import collaborators
+    # Import collaborators (as pending invitations)
     for collab in collabs_data:
         email = collab.get("email", "").strip()
         role = collab.get("role", "guest")
         if email and role in ("student", "guest", "reviewer", "admin"):
             conn.execute(
-                "INSERT OR IGNORE INTO test_collaborators (test_id, user_email, role) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO test_collaborators (test_id, user_email, role, status) VALUES (?, ?, ?, 'pending')",
                 (test_id, email, role),
             )
 
@@ -484,17 +522,33 @@ def get_test(test_id):
 
 
 def get_all_tests(user_id=None):
-    """Return public + private tests (visible to all), plus owner's hidden tests."""
+    """Return public + private tests (visible to all), plus hidden tests the user has access to.
+
+    Hidden tests are shown if the user:
+    - Is the owner
+    - Is a direct collaborator (accepted)
+    - Is a member of a program that includes the test (accepted)
+    """
     conn = get_connection()
     if user_id:
         rows = conn.execute(
-            """SELECT id, owner_id, title, description, author, is_public,
-                      (SELECT COUNT(*) FROM questions WHERE questions.test_id = tests.id) as q_count,
-                      language, visibility
-               FROM tests
-               WHERE visibility IN ('public', 'private') OR owner_id = ?
-               ORDER BY title""",
-            (user_id,),
+            """SELECT DISTINCT t.id, t.owner_id, t.title, t.description, t.author, t.is_public,
+                      (SELECT COUNT(*) FROM questions WHERE questions.test_id = t.id) as q_count,
+                      t.language, t.visibility
+               FROM tests t
+               LEFT JOIN test_collaborators tc ON tc.test_id = t.id
+                   AND (tc.user_id = ? OR tc.user_email = (SELECT username FROM users WHERE id = ?))
+                   AND tc.status = 'accepted'
+               LEFT JOIN program_tests pt ON pt.test_id = t.id
+               LEFT JOIN program_collaborators pc ON pc.program_id = pt.program_id
+                   AND (pc.user_id = ? OR pc.user_email = (SELECT username FROM users WHERE id = ?))
+                   AND pc.status = 'accepted'
+               WHERE t.visibility IN ('public', 'private', 'restricted')
+                  OR t.owner_id = ?
+                  OR tc.id IS NOT NULL
+                  OR pc.id IS NOT NULL
+               ORDER BY t.title""",
+            (user_id, user_id, user_id, user_id, user_id),
         ).fetchall()
     else:
         rows = conn.execute(
@@ -502,7 +556,7 @@ def get_all_tests(user_id=None):
                       (SELECT COUNT(*) FROM questions WHERE questions.test_id = tests.id) as q_count,
                       language, visibility
                FROM tests
-               WHERE visibility IN ('public', 'private')
+               WHERE visibility IN ('public', 'private', 'restricted')
                ORDER BY title""",
         ).fetchall()
     conn.close()
@@ -827,16 +881,26 @@ def get_program(program_id):
 
 
 def get_all_programs(user_id):
-    """Return public/private programs + user's own programs."""
+    """Return public/private programs + hidden programs the user has access to.
+
+    Hidden programs are shown if the user:
+    - Is the owner
+    - Is a direct collaborator (accepted)
+    """
     conn = get_connection()
     rows = conn.execute(
-        """SELECT p.id, p.owner_id, p.title, p.description, p.created_at,
+        """SELECT DISTINCT p.id, p.owner_id, p.title, p.description, p.created_at,
                   (SELECT COUNT(*) FROM program_tests WHERE program_id = p.id) as test_count,
                   p.visibility
            FROM programs p
-           WHERE p.visibility IN ('public', 'private') OR p.owner_id = ?
+           LEFT JOIN program_collaborators pc ON pc.program_id = p.id
+               AND (pc.user_id = ? OR pc.user_email = (SELECT username FROM users WHERE id = ?))
+               AND pc.status = 'accepted'
+           WHERE p.visibility IN ('public', 'private', 'restricted')
+              OR p.owner_id = ?
+              OR pc.id IS NOT NULL
            ORDER BY p.title""",
-        (user_id,),
+        (user_id, user_id, user_id),
     ).fetchall()
     conn.close()
     return [
@@ -846,16 +910,33 @@ def get_all_programs(user_id):
     ]
 
 
-def add_test_to_program(program_id, test_id):
+def add_test_to_program(program_id, test_id, program_visibility=None):
+    """Add a test to a program with an optional visibility override for program members.
+
+    program_visibility can be 'public', 'private', 'restricted', or 'hidden'.
+    If None, defaults to the test's base visibility.
+    'restricted' means users can see and take the test, but materials are hidden.
+    """
+    if program_visibility not in ("public", "private", "restricted", "hidden", None):
+        program_visibility = None
     conn = get_connection()
+    # If no visibility specified, use the test's base visibility
+    if program_visibility is None:
+        row = conn.execute("SELECT visibility FROM tests WHERE id = ?", (test_id,)).fetchone()
+        program_visibility = row[0] if row and row[0] else "public"
     try:
         conn.execute(
-            "INSERT INTO program_tests (program_id, test_id) VALUES (?, ?)",
-            (program_id, test_id),
+            "INSERT INTO program_tests (program_id, test_id, program_visibility) VALUES (?, ?, ?)",
+            (program_id, test_id, program_visibility),
         )
         conn.commit()
     except sqlite3.IntegrityError:
-        pass
+        # Already exists, update the program_visibility
+        conn.execute(
+            "UPDATE program_tests SET program_visibility = ? WHERE program_id = ? AND test_id = ?",
+            (program_visibility, program_id, test_id),
+        )
+        conn.commit()
     conn.close()
 
 
@@ -873,7 +954,9 @@ def get_program_tests(program_id):
     conn = get_connection()
     rows = conn.execute(
         """SELECT t.id, t.title, t.description, t.author,
-                  (SELECT COUNT(*) FROM questions WHERE test_id = t.id) as q_count
+                  (SELECT COUNT(*) FROM questions WHERE test_id = t.id) as q_count,
+                  pt.program_visibility,
+                  t.visibility
            FROM tests t
            JOIN program_tests pt ON pt.test_id = t.id
            WHERE pt.program_id = ?
@@ -882,9 +965,27 @@ def get_program_tests(program_id):
     ).fetchall()
     conn.close()
     return [
-        {"id": r[0], "title": r[1], "description": r[2], "author": r[3], "question_count": r[4]}
+        {"id": r[0], "title": r[1], "description": r[2], "author": r[3], "question_count": r[4],
+         "program_visibility": r[5] or r[6] or "public",
+         "test_visibility": r[6] or "public"}
         for r in rows
     ]
+
+
+def update_program_test_visibility(program_id, test_id, program_visibility):
+    """Update the visibility override for a test within a program.
+
+    'restricted' means users can see and take the test, but materials are hidden.
+    """
+    if program_visibility not in ("public", "private", "restricted", "hidden"):
+        program_visibility = "public"
+    conn = get_connection()
+    conn.execute(
+        "UPDATE program_tests SET program_visibility = ? WHERE program_id = ? AND test_id = ?",
+        (program_visibility, program_id, test_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_program_questions(program_id):
@@ -1095,6 +1196,218 @@ def get_all_wrong_question_ids(user_id, test_id=None):
     return [{"question_id": r[0], "test_id": r[1], "correct": r[2], "wrong": r[3]} for r in rows]
 
 
+def get_topic_statistics(user_id, test_id):
+    """Get statistics for each topic in a test for a specific user.
+
+    Returns a dict mapping topic -> {
+        total: int,
+        correct: int,
+        incorrect: int,
+        percent_correct: float,
+        history: [{date, correct, incorrect, percent}]  # daily aggregates
+    }
+    """
+    conn = get_connection()
+
+    # Get overall stats per topic
+    # Note: question_history.question_id stores question_num, not questions.id
+    rows = conn.execute(
+        """SELECT q.tag,
+                  COUNT(*) as total,
+                  SUM(CASE WHEN qh.correct THEN 1 ELSE 0 END) as correct,
+                  SUM(CASE WHEN NOT qh.correct THEN 1 ELSE 0 END) as incorrect
+           FROM question_history qh
+           JOIN questions q ON qh.question_id = q.question_num AND qh.test_id = q.test_id
+           WHERE qh.user_id = ? AND qh.test_id = ?
+           GROUP BY q.tag
+           ORDER BY q.tag""",
+        (user_id, test_id),
+    ).fetchall()
+
+    stats = {}
+    for row in rows:
+        tag, total, correct, incorrect = row
+        stats[tag] = {
+            "total": total,
+            "correct": correct,
+            "incorrect": incorrect,
+            "percent_correct": round(100 * correct / total, 1) if total > 0 else 0,
+            "history": []
+        }
+
+    # Get daily history per topic for trend chart
+    history_rows = conn.execute(
+        """SELECT q.tag,
+                  DATE(qh.answered_at) as answer_date,
+                  SUM(CASE WHEN qh.correct THEN 1 ELSE 0 END) as correct,
+                  SUM(CASE WHEN NOT qh.correct THEN 1 ELSE 0 END) as incorrect
+           FROM question_history qh
+           JOIN questions q ON qh.question_id = q.question_num AND qh.test_id = q.test_id
+           WHERE qh.user_id = ? AND qh.test_id = ?
+           GROUP BY q.tag, DATE(qh.answered_at)
+           ORDER BY q.tag, answer_date""",
+        (user_id, test_id),
+    ).fetchall()
+
+    for row in history_rows:
+        tag, date, correct, incorrect = row
+        if tag in stats:
+            total = correct + incorrect
+            stats[tag]["history"].append({
+                "date": date,
+                "correct": correct,
+                "incorrect": incorrect,
+                "percent": round(100 * correct / total, 1) if total > 0 else 0
+            })
+
+    conn.close()
+    return stats
+
+
+def get_tests_performance(user_id, test_ids=None):
+    """Get overall performance for multiple tests for a specific user.
+
+    Args:
+        user_id: The user ID
+        test_ids: Optional list of test IDs to filter. If None, returns all tests.
+
+    Returns a dict mapping test_id -> {
+        total: int,
+        correct: int,
+        percent_correct: float
+    }
+    """
+    conn = get_connection()
+
+    if test_ids:
+        placeholders = ",".join("?" * len(test_ids))
+        query = f"""
+            SELECT test_id,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN correct THEN 1 ELSE 0 END) as correct
+            FROM question_history
+            WHERE user_id = ? AND test_id IN ({placeholders})
+            GROUP BY test_id
+        """
+        rows = conn.execute(query, [user_id] + list(test_ids)).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT test_id,
+                      COUNT(*) as total,
+                      SUM(CASE WHEN correct THEN 1 ELSE 0 END) as correct
+               FROM question_history
+               WHERE user_id = ?
+               GROUP BY test_id""",
+            (user_id,),
+        ).fetchall()
+
+    conn.close()
+
+    result = {}
+    for row in rows:
+        test_id, total, correct = row
+        result[test_id] = {
+            "total": total,
+            "correct": correct,
+            "percent_correct": round(100 * correct / total, 1) if total > 0 else 0
+        }
+    return result
+
+
+def get_user_test_ids(user_id):
+    """Get list of test IDs that a user has answered questions for."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT DISTINCT test_id FROM question_history WHERE user_id = ? AND test_id IS NOT NULL",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_user_session_count(user_id):
+    """Get count of test sessions completed by a user."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM test_sessions WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_user_program_ids(user_id):
+    """Get list of program IDs where the user has answered questions for tests in those programs."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT DISTINCT pt.program_id
+           FROM question_history qh
+           JOIN program_tests pt ON pt.test_id = qh.test_id
+           WHERE qh.user_id = ? AND qh.test_id IS NOT NULL""",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_programs_performance(user_id, program_ids=None):
+    """Get overall performance for multiple programs for a specific user.
+
+    Aggregates performance across all tests in each program.
+
+    Args:
+        user_id: The user ID
+        program_ids: Optional list of program IDs to filter. If None, returns all programs.
+
+    Returns a dict mapping program_id -> {
+        total: int,
+        correct: int,
+        percent_correct: float,
+        tests_taken: int  (number of distinct tests in this program the user has answered)
+    }
+    """
+    conn = get_connection()
+
+    if program_ids:
+        placeholders = ",".join("?" * len(program_ids))
+        query = f"""
+            SELECT pt.program_id,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN qh.correct THEN 1 ELSE 0 END) as correct,
+                   COUNT(DISTINCT qh.test_id) as tests_taken
+            FROM question_history qh
+            JOIN program_tests pt ON pt.test_id = qh.test_id
+            WHERE qh.user_id = ? AND pt.program_id IN ({placeholders})
+            GROUP BY pt.program_id
+        """
+        rows = conn.execute(query, [user_id] + list(program_ids)).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT pt.program_id,
+                      COUNT(*) as total,
+                      SUM(CASE WHEN qh.correct THEN 1 ELSE 0 END) as correct,
+                      COUNT(DISTINCT qh.test_id) as tests_taken
+               FROM question_history qh
+               JOIN program_tests pt ON pt.test_id = qh.test_id
+               WHERE qh.user_id = ?
+               GROUP BY pt.program_id""",
+            (user_id,),
+        ).fetchall()
+
+    conn.close()
+
+    result = {}
+    for row in rows:
+        program_id, total, correct, tests_taken = row
+        result[program_id] = {
+            "total": total,
+            "correct": correct,
+            "percent_correct": round(100 * correct / total, 1) if total > 0 else 0,
+            "tests_taken": tests_taken
+        }
+    return result
+
+
 # --- Profile ---
 
 def get_user_profile(user_id):
@@ -1141,8 +1454,8 @@ def get_user_global_role(user_id):
 
 
 def set_user_global_role(user_id, role):
-    """Set the global role for a user. Role must be 'student', 'free', 'premium', or 'admin'."""
-    if role not in ("student", "free", "premium", "admin"):
+    """Set the global role for a user. Role must be 'free', 'premium', or 'admin'."""
+    if role not in ("free", "premium", "admin"):
         raise ValueError(f"Invalid role: {role}")
     conn = get_connection()
     conn.execute(
@@ -1154,8 +1467,8 @@ def set_user_global_role(user_id, role):
 
 
 def set_user_global_role_by_email(email, role):
-    """Set the global role for a user by email. Role must be 'student', 'free', 'premium', or 'admin'."""
-    if role not in ("student", "free", "premium", "admin"):
+    """Set the global role for a user by email. Role must be 'free', 'premium', or 'admin'."""
+    if role not in ("free", "premium", "admin"):
         raise ValueError(f"Invalid role: {role}")
     conn = get_connection()
     conn.execute(
@@ -1203,17 +1516,18 @@ def toggle_favorite(user_id, test_id):
 # --- Collaborators ---
 
 def add_collaborator(test_id, email, role):
-    """Add or update a collaborator for a test."""
+    """Add or update a collaborator for a test. New invitations start as 'pending'."""
     conn = get_connection()
     # Try to resolve user_id from email
     row = conn.execute("SELECT id FROM users WHERE username = ?", (email,)).fetchone()
     uid = row[0] if row else None
     try:
         conn.execute(
-            "INSERT INTO test_collaborators (test_id, user_email, user_id, role) VALUES (?, ?, ?, ?)",
+            "INSERT INTO test_collaborators (test_id, user_email, user_id, role, status) VALUES (?, ?, ?, ?, 'pending')",
             (test_id, email, uid, role),
         )
     except sqlite3.IntegrityError:
+        # If re-inviting, only update role, don't change status
         conn.execute(
             "UPDATE test_collaborators SET role = ?, user_id = COALESCE(?, user_id) WHERE test_id = ? AND user_email = ?",
             (role, uid, test_id, email),
@@ -1242,43 +1556,118 @@ def update_collaborator_role(test_id, email, new_role):
 def get_collaborators(test_id):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, user_email, user_id, role, invited_at FROM test_collaborators WHERE test_id = ? ORDER BY invited_at",
+        "SELECT id, user_email, user_id, role, invited_at, status FROM test_collaborators WHERE test_id = ? ORDER BY invited_at",
         (test_id,),
     ).fetchall()
     conn.close()
-    return [{"id": r[0], "email": r[1], "user_id": r[2], "role": r[3], "invited_at": r[4]} for r in rows]
+    return [{"id": r[0], "email": r[1], "user_id": r[2], "role": r[3], "invited_at": r[4], "status": r[5]} for r in rows]
+
+
+def _min_role(role1, role2):
+    """Return the lesser of two roles based on privilege hierarchy."""
+    role_order = {"student": 0, "guest": 1, "reviewer": 2, "admin": 3}
+    r1 = role_order.get(role1, 0)
+    r2 = role_order.get(role2, 0)
+    roles = ["student", "guest", "reviewer", "admin"]
+    return roles[min(r1, r2)]
+
+
+def get_visibility_options_for_test(test_visibility):
+    """Return all visibility options for program_visibility selector.
+
+    Visibility hierarchy (from least to most open): hidden < private < restricted < public
+
+    All 4 options are always available. The effective visibility is computed as the
+    more restrictive of the test's base visibility and the program_visibility.
+    For example, if a test is 'private' and program_visibility is 'public', the
+    effective visibility for program members is still 'private'.
+
+    'restricted' means users can see and take the test, but materials are hidden
+    from users without explicit access.
+    """
+    # Return all options - the effective visibility constraint is applied at access check time
+    return ["public", "restricted", "private", "hidden"]
+
+
+def get_effective_visibility(test_visibility, program_visibility):
+    """Return the more restrictive of two visibility levels.
+
+    Visibility hierarchy (from least to most open): hidden < private < restricted < public
+
+    The effective visibility is the minimum (more restrictive) of the two.
+    For example:
+    - test='private', program='public' → effective='private'
+    - test='public', program='restricted' → effective='restricted'
+    - test='restricted', program='hidden' → effective='hidden'
+    """
+    visibility_order = {"hidden": 0, "private": 1, "restricted": 2, "public": 3}
+    test_level = visibility_order.get(test_visibility, 3)
+    program_level = visibility_order.get(program_visibility, 3)
+    # Return the more restrictive (lower level) visibility
+    levels = ["hidden", "private", "restricted", "public"]
+    return levels[min(test_level, program_level)]
 
 
 def get_user_role_for_test(test_id, user_id):
     """Return the collaboration role for a user on a test, or None.
-    Checks direct test collaborators first, then program-level collaborators."""
+    Only returns role if invitation is accepted.
+    Checks direct test collaborators first, then program-level collaborators.
+    For program access, returns the program role if program_visibility grants access."""
     conn = get_connection()
-    # Direct test collaborator
+    # Direct test collaborator (only if accepted)
     row = conn.execute(
         """SELECT tc.role FROM test_collaborators tc
            LEFT JOIN users u ON u.username = tc.user_email
-           WHERE tc.test_id = ? AND (tc.user_id = ? OR u.id = ?)
+           WHERE tc.test_id = ? AND (tc.user_id = ? OR u.id = ?) AND tc.status = 'accepted'
            LIMIT 1""",
         (test_id, user_id, user_id),
     ).fetchone()
     if row:
         conn.close()
         return row[0]
-    # Program-level collaborator (test belongs to a program the user collaborates on)
+    # Program-level collaborator (test belongs to a program the user collaborates on, only if accepted)
+    # program_visibility determines access level for program members
     row = conn.execute(
-        """SELECT pc.role FROM program_collaborators pc
+        """SELECT pc.role, pt.program_visibility FROM program_collaborators pc
            JOIN program_tests pt ON pt.program_id = pc.program_id
            LEFT JOIN users u ON u.username = pc.user_email
-           WHERE pt.test_id = ? AND (pc.user_id = ? OR u.id = ?)
+           WHERE pt.test_id = ? AND (pc.user_id = ? OR u.id = ?) AND pc.status = 'accepted'
            LIMIT 1""",
         (test_id, user_id, user_id),
     ).fetchone()
     conn.close()
-    return row[0] if row else None
+    if row:
+        program_role = row[0]
+        program_visibility = row[1] or "public"
+        # Program members get access based on program_visibility
+        # They get their program role for the test (student = take test only, guest = view, etc.)
+        # If program_visibility is public/private, they can access; if hidden, they can still access as program member
+        return program_role
+    return None
+
+
+def has_direct_test_access(test_id, user_id):
+    """Check if user has direct access to a test (not through program membership).
+
+    Returns True if user is a direct collaborator on the test (with accepted status).
+    Does NOT check program-level access - use this for hidden test visibility checks.
+    """
+    if not user_id:
+        return False
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT tc.id FROM test_collaborators tc
+           LEFT JOIN users u ON u.username = tc.user_email
+           WHERE tc.test_id = ? AND (tc.user_id = ? OR u.id = ?) AND tc.status = 'accepted'
+           LIMIT 1""",
+        (test_id, user_id, user_id),
+    ).fetchone()
+    conn.close()
+    return row is not None
 
 
 def get_shared_tests(user_id):
-    """Return tests shared with a user (as collaborator)."""
+    """Return tests shared with a user (as collaborator, only accepted invitations)."""
     conn = get_connection()
     rows = conn.execute(
         """SELECT t.id, t.owner_id, t.title, t.description, t.author, t.is_public,
@@ -1287,7 +1676,7 @@ def get_shared_tests(user_id):
            FROM tests t
            JOIN test_collaborators tc ON tc.test_id = t.id
            LEFT JOIN users u ON u.username = tc.user_email
-           WHERE tc.user_id = ? OR u.id = ?
+           WHERE (tc.user_id = ? OR u.id = ?) AND tc.status = 'accepted'
            ORDER BY t.title""",
         (user_id, user_id),
     ).fetchall()
@@ -1318,15 +1707,17 @@ def resolve_collaborator_user_id(email, user_id):
 # --- Program Collaborators ---
 
 def add_program_collaborator(program_id, email, role):
+    """Add or update a collaborator for a program. New invitations start as 'pending'."""
     conn = get_connection()
     row = conn.execute("SELECT id FROM users WHERE username = ?", (email,)).fetchone()
     uid = row[0] if row else None
     try:
         conn.execute(
-            "INSERT INTO program_collaborators (program_id, user_email, user_id, role) VALUES (?, ?, ?, ?)",
+            "INSERT INTO program_collaborators (program_id, user_email, user_id, role, status) VALUES (?, ?, ?, ?, 'pending')",
             (program_id, email, uid, role),
         )
     except sqlite3.IntegrityError:
+        # If re-inviting, only update role, don't change status
         conn.execute(
             "UPDATE program_collaborators SET role = ?, user_id = COALESCE(?, user_id) WHERE program_id = ? AND user_email = ?",
             (role, uid, program_id, email),
@@ -1355,20 +1746,21 @@ def update_program_collaborator_role(program_id, email, new_role):
 def get_program_collaborators(program_id):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, user_email, user_id, role, invited_at FROM program_collaborators WHERE program_id = ? ORDER BY invited_at",
+        "SELECT id, user_email, user_id, role, invited_at, status FROM program_collaborators WHERE program_id = ? ORDER BY invited_at",
         (program_id,),
     ).fetchall()
     conn.close()
-    return [{"id": r[0], "email": r[1], "user_id": r[2], "role": r[3], "invited_at": r[4]} for r in rows]
+    return [{"id": r[0], "email": r[1], "user_id": r[2], "role": r[3], "invited_at": r[4], "status": r[5]} for r in rows]
 
 
 def get_user_role_for_program(program_id, user_id):
-    """Return the collaboration role for a user on a program, or None."""
+    """Return the collaboration role for a user on a program, or None.
+    Only returns role if invitation is accepted."""
     conn = get_connection()
     row = conn.execute(
         """SELECT pc.role FROM program_collaborators pc
            LEFT JOIN users u ON u.username = pc.user_email
-           WHERE pc.program_id = ? AND (pc.user_id = ? OR u.id = ?)
+           WHERE pc.program_id = ? AND (pc.user_id = ? OR u.id = ?) AND pc.status = 'accepted'
            LIMIT 1""",
         (program_id, user_id, user_id),
     ).fetchone()
@@ -1377,7 +1769,7 @@ def get_user_role_for_program(program_id, user_id):
 
 
 def get_shared_programs(user_id):
-    """Return programs shared with a user (as collaborator)."""
+    """Return programs shared with a user (as collaborator, only accepted invitations)."""
     conn = get_connection()
     rows = conn.execute(
         """SELECT p.id, p.owner_id, p.title, p.description, p.created_at,
@@ -1386,7 +1778,7 @@ def get_shared_programs(user_id):
            FROM programs p
            JOIN program_collaborators pc ON pc.program_id = p.id
            LEFT JOIN users u ON u.username = pc.user_email
-           WHERE pc.user_id = ? OR u.id = ?
+           WHERE (pc.user_id = ? OR u.id = ?) AND pc.status = 'accepted'
            ORDER BY p.title""",
         (user_id, user_id),
     ).fetchall()
@@ -1396,6 +1788,138 @@ def get_shared_programs(user_id):
          "created_at": r[4], "test_count": r[5], "visibility": r[6] or "public", "role": r[7]}
         for r in rows
     ]
+
+
+# --- Invitations ---
+
+def get_pending_invitations(user_id):
+    """Get all pending test and program invitations for a user."""
+    conn = get_connection()
+    # Get user email
+    user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user_row:
+        conn.close()
+        return {"tests": [], "programs": []}
+    user_email = user_row[0]
+
+    # Pending test invitations
+    test_rows = conn.execute(
+        """SELECT tc.id, t.id as test_id, t.title, tc.role, tc.invited_at,
+                  u.display_name as inviter_name, u.username as inviter_email
+           FROM test_collaborators tc
+           JOIN tests t ON t.id = tc.test_id
+           LEFT JOIN users u ON u.id = t.owner_id
+           WHERE (tc.user_id = ? OR tc.user_email = ?) AND tc.status = 'pending'
+           ORDER BY tc.invited_at DESC""",
+        (user_id, user_email),
+    ).fetchall()
+
+    # Pending program invitations
+    program_rows = conn.execute(
+        """SELECT pc.id, p.id as program_id, p.title, pc.role, pc.invited_at,
+                  u.display_name as inviter_name, u.username as inviter_email
+           FROM program_collaborators pc
+           JOIN programs p ON p.id = pc.program_id
+           LEFT JOIN users u ON u.id = p.owner_id
+           WHERE (pc.user_id = ? OR pc.user_email = ?) AND pc.status = 'pending'
+           ORDER BY pc.invited_at DESC""",
+        (user_id, user_email),
+    ).fetchall()
+
+    conn.close()
+
+    tests = [
+        {"id": r[0], "test_id": r[1], "title": r[2], "role": r[3], "invited_at": r[4],
+         "inviter_name": r[5] or r[6], "inviter_email": r[6]}
+        for r in test_rows
+    ]
+    programs = [
+        {"id": r[0], "program_id": r[1], "title": r[2], "role": r[3], "invited_at": r[4],
+         "inviter_name": r[5] or r[6], "inviter_email": r[6]}
+        for r in program_rows
+    ]
+
+    return {"tests": tests, "programs": programs}
+
+
+def accept_test_invitation(test_id, user_id):
+    """Accept a test invitation."""
+    conn = get_connection()
+    user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user_row:
+        conn.execute(
+            """UPDATE test_collaborators SET status = 'accepted', user_id = ?
+               WHERE test_id = ? AND (user_id = ? OR user_email = ?) AND status = 'pending'""",
+            (user_id, test_id, user_id, user_row[0]),
+        )
+        conn.commit()
+    conn.close()
+
+
+def decline_test_invitation(test_id, user_id):
+    """Decline a test invitation (removes the invitation)."""
+    conn = get_connection()
+    user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user_row:
+        conn.execute(
+            """DELETE FROM test_collaborators
+               WHERE test_id = ? AND (user_id = ? OR user_email = ?) AND status = 'pending'""",
+            (test_id, user_id, user_row[0]),
+        )
+        conn.commit()
+    conn.close()
+
+
+def accept_program_invitation(program_id, user_id):
+    """Accept a program invitation."""
+    conn = get_connection()
+    user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user_row:
+        conn.execute(
+            """UPDATE program_collaborators SET status = 'accepted', user_id = ?
+               WHERE program_id = ? AND (user_id = ? OR user_email = ?) AND status = 'pending'""",
+            (user_id, program_id, user_id, user_row[0]),
+        )
+        conn.commit()
+    conn.close()
+
+
+def decline_program_invitation(program_id, user_id):
+    """Decline a program invitation (removes the invitation)."""
+    conn = get_connection()
+    user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user_row:
+        conn.execute(
+            """DELETE FROM program_collaborators
+               WHERE program_id = ? AND (user_id = ? OR user_email = ?) AND status = 'pending'""",
+            (program_id, user_id, user_row[0]),
+        )
+        conn.commit()
+    conn.close()
+
+
+def get_pending_invitation_count(user_id):
+    """Get the count of pending invitations for badge display."""
+    conn = get_connection()
+    user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user_row:
+        conn.close()
+        return 0
+
+    test_count = conn.execute(
+        """SELECT COUNT(*) FROM test_collaborators
+           WHERE (user_id = ? OR user_email = ?) AND status = 'pending'""",
+        (user_id, user_row[0]),
+    ).fetchone()[0]
+
+    program_count = conn.execute(
+        """SELECT COUNT(*) FROM program_collaborators
+           WHERE (user_id = ? OR user_email = ?) AND status = 'pending'""",
+        (user_id, user_row[0]),
+    ).fetchone()[0]
+
+    conn.close()
+    return test_count + program_count
 
 
 def get_favorite_tests(user_id):
