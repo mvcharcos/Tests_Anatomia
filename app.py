@@ -2467,23 +2467,25 @@ def show_dashboard():
 
     # Get user's test history
     test_ids = get_user_test_ids(user_id)
-    if not test_ids:
-        st.info(t("no_tests_taken"))
-        return
-
-    # Get performance data for all tests
-    test_performance = get_tests_performance(user_id, test_ids)
     session_count = get_user_session_count(user_id)
 
-    # Calculate global stats
-    total_questions = sum(p["total"] for p in test_performance.values())
-    total_correct = sum(p["correct"] for p in test_performance.values())
-    avg_score = round(100 * total_correct / total_questions, 1) if total_questions > 0 else 0
+    # Get performance data if user has taken tests
+    if test_ids:
+        test_performance = get_tests_performance(user_id, test_ids)
+        total_questions = sum(p["total"] for p in test_performance.values())
+        total_correct = sum(p["correct"] for p in test_performance.values())
+        avg_score = round(100 * total_correct / total_questions, 1) if total_questions > 0 else 0
+        earned_trophies = _compute_user_trophies(user_id, test_performance, session_count)
+        earned_keys = {key for key, _, _ in earned_trophies}
+    else:
+        test_performance = {}
+        total_questions = 0
+        total_correct = 0
+        avg_score = 0
+        earned_keys = set()
 
     # --- Trophies Section ---
     st.subheader(t("your_trophies"))
-    earned_trophies = _compute_user_trophies(user_id, test_performance, session_count)
-    earned_keys = {key for key, _, _ in earned_trophies}
 
     # Define all available trophies with descriptions
     all_trophies = [
@@ -2510,6 +2512,11 @@ def show_dashboard():
             st.caption(f"<div style='text-align:center;font-size:0.8em;color:#666;'>{desc}</div>", unsafe_allow_html=True)
 
     st.divider()
+
+    # If user has not taken any tests, show message and stop here
+    if not test_ids:
+        st.info(t("no_tests_taken"))
+        return
 
     # --- Global Performance Section ---
     st.subheader(t("global_performance"))
